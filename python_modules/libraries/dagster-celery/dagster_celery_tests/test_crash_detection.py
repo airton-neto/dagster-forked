@@ -1,12 +1,20 @@
 import weakref
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from celery import Celery
+from celery.exceptions import Ignore
 from dagster import DagsterRunStatus
 from dagster._core.launcher import WorkerStatus
 from dagster._core.launcher.base import ResumeRunContext
-from dagster_celery.launcher import CeleryRunLauncher
-from dagster_celery.tags import DAGSTER_CELERY_TASK_ID_TAG
+from dagster_celery.launcher import (
+    HEALTH_CHECK_MAX_RETRIES,
+    TASK_SUCCESS_TERMINAL_GRACE_SECONDS,
+    CeleryRunLauncher,
+)
+from dagster_celery.tags import DAGSTER_CELERY_TASK_ID_TAG, DAGSTER_CELERY_WORKER_HOSTNAME_TAG
+from dagster_celery.tasks import create_execute_job_task
 
 
 @pytest.fixture
@@ -70,14 +78,135 @@ class TestResumeRun:
             )
 
 
+def _make_current_run(finished: bool, status=DagsterRunStatus.STARTED):
+    current = MagicMock()
+    current.run_id = "test-run-id"
+    current.is_finished = finished
+    current.status = status
+    return current
+
+
 class TestCheckRunWorkerHealth:
-    def test_task_success_returns_success(self, launcher, mock_celery_app):
+    def test_task_success_run_finished_returns_success(self, launcher, mock_celery_app):
         run = _make_run()
+        launcher._instance.get_run_by_id.return_value = _make_current_run(finished=True)  # noqa: SLF001
         result = mock_celery_app.AsyncResult.return_value
         result.state = "SUCCESS"
 
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.SUCCESS
+
+    def test_task_success_run_not_finished_past_grace_returns_failed(
+        self, launcher, mock_celery_app
+    ):
+        """Task SUCCESS but run never reached a terminal state (e.g. the result was
+        overwritten by a duplicate delivery no-op) must be reported unhealthy.
+        """
+        run = _make_run()
+        launcher._instance.get_run_by_id.return_value = _make_current_run(finished=False)  # noqa: SLF001
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "SUCCESS"
+        result.date_done = datetime.now(timezone.utc) - timedelta(
+            seconds=TASK_SUCCESS_TERMINAL_GRACE_SECONDS + 60
+        )
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.FAILED
+        assert "terminal" in health.msg.lower()
+
+    def test_task_success_run_not_finished_within_grace_returns_running(
+        self, launcher, mock_celery_app
+    ):
+        """Right after task completion the run terminal event may still be in flight."""
+        run = _make_run()
+        launcher._instance.get_run_by_id.return_value = _make_current_run(finished=False)  # noqa: SLF001
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "SUCCESS"
+        result.date_done = datetime.now(timezone.utc)
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+
+    def test_task_success_run_not_finished_no_date_done_returns_failed(
+        self, launcher, mock_celery_app
+    ):
+        run = _make_run()
+        launcher._instance.get_run_by_id.return_value = _make_current_run(finished=False)  # noqa: SLF001
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "SUCCESS"
+        result.date_done = None
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.FAILED
+
+    def test_task_success_naive_date_done_is_treated_as_utc(self, launcher, mock_celery_app):
+        run = _make_run()
+        launcher._instance.get_run_by_id.return_value = _make_current_run(finished=False)  # noqa: SLF001
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "SUCCESS"
+        result.date_done = datetime.utcnow() - timedelta(
+            seconds=TASK_SUCCESS_TERMINAL_GRACE_SECONDS + 60
+        )
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.FAILED
+
+    def test_pending_with_hostname_tag_pings_worker_and_returns_running(
+        self, launcher, mock_celery_app
+    ):
+        """PENDING may mean the result backend lost the task meta (e.g. redis restart).
+        If the run is tagged with the worker hostname, ping it instead of giving up.
+        """
+        run = _make_run()
+        run.tags[DAGSTER_CELERY_WORKER_HOSTNAME_TAG] = "celery@worker-pod-1"
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "PENDING"
+
+        inspect_mock = MagicMock()
+        inspect_mock.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
+        mock_celery_app.control.inspect.return_value = inspect_mock
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+        mock_celery_app.control.inspect.assert_called_with(
+            destination=["celery@worker-pod-1"], timeout=2.0
+        )
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_pending_with_hostname_tag_dead_worker_returns_failed(
+        self, mock_sleep, launcher, mock_celery_app
+    ):
+        run = _make_run()
+        run.tags[DAGSTER_CELERY_WORKER_HOSTNAME_TAG] = "celery@worker-pod-1"
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "PENDING"
+
+        inspect_mock = MagicMock()
+        inspect_mock.ping.return_value = None
+        mock_celery_app.control.inspect.return_value = inspect_mock
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.FAILED
+
+    def test_started_prefers_run_tag_hostname_over_result_meta(self, launcher, mock_celery_app):
+        """The run tag is written by the worker that actually executes the run; the
+        result meta may have been overwritten by a duplicate delivery on another worker.
+        """
+        run = _make_run()
+        run.tags[DAGSTER_CELERY_WORKER_HOSTNAME_TAG] = "celery@real-worker"
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "STARTED"
+        result.info = {"hostname": "celery@duplicate-worker"}
+
+        inspect_mock = MagicMock()
+        inspect_mock.ping.return_value = {"celery@real-worker": {"ok": "pong"}}
+        mock_celery_app.control.inspect.return_value = inspect_mock
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+        mock_celery_app.control.inspect.assert_called_with(
+            destination=["celery@real-worker"], timeout=2.0
+        )
 
     def test_task_failure_returns_failed(self, launcher, mock_celery_app):
         run = _make_run()
@@ -87,13 +216,16 @@ class TestCheckRunWorkerHealth:
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.FAILED
 
-    def test_task_pending_returns_unknown(self, launcher, mock_celery_app):
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_task_pending_retries_then_returns_unknown(self, mock_sleep, launcher, mock_celery_app):
+        """PENDING status retries HEALTH_CHECK_MAX_RETRIES times before returning UNKNOWN."""
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "PENDING"
 
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.UNKNOWN
+        assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
     def test_task_started_worker_alive_returns_running(self, launcher, mock_celery_app):
         """When Celery says STARTED and the worker responds to ping, return RUNNING."""
@@ -110,14 +242,17 @@ class TestCheckRunWorkerHealth:
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.RUNNING
 
-    def test_task_started_worker_dead_returns_failed(self, launcher, mock_celery_app):
-        """When Celery says STARTED but the worker doesn't respond to ping, return FAILED."""
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_task_started_worker_dead_retries_then_returns_failed(
+        self, mock_sleep, launcher, mock_celery_app
+    ):
+        """When worker doesn't respond to ping, retries then returns FAILED."""
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "STARTED"
         result.info = {"hostname": "celery@worker-pod-1"}
 
-        # Worker does NOT respond to ping
+        # Worker does NOT respond to ping on any attempt
         inspect_mock = MagicMock()
         inspect_mock.ping.return_value = None
         mock_celery_app.control.inspect.return_value = inspect_mock
@@ -125,9 +260,13 @@ class TestCheckRunWorkerHealth:
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.FAILED
         assert "not responding" in health.msg.lower()
+        assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
-    def test_task_started_no_worker_info_returns_unknown(self, launcher, mock_celery_app):
-        """When worker hostname is unavailable, report UNKNOWN so monitoring can act."""
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_task_started_no_worker_info_retries_then_returns_unknown(
+        self, mock_sleep, launcher, mock_celery_app
+    ):
+        """When worker hostname is unavailable, retries then reports UNKNOWN."""
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "STARTED"
@@ -136,17 +275,136 @@ class TestCheckRunWorkerHealth:
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.UNKNOWN
         assert "hostname" in health.msg.lower()
+        assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
-    def test_task_started_inspect_raises_returns_unknown(self, launcher, mock_celery_app):
-        """When inspect API fails (broker issue), report UNKNOWN so monitoring can act."""
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_task_started_inspect_raises_retries_then_returns_unknown(
+        self, mock_sleep, launcher, mock_celery_app
+    ):
+        """When inspect API fails (broker issue), retries then reports UNKNOWN."""
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "STARTED"
         result.info = {"hostname": "celery@worker-pod-1"}
 
-        # Inspect raises an exception
+        # Inspect raises an exception on every attempt
         mock_celery_app.control.inspect.side_effect = Exception("Broker connection failed")
 
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.UNKNOWN
         assert "broker connection failed" in health.msg.lower()
+        assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_ping_fails_then_succeeds_returns_running(self, mock_sleep, launcher, mock_celery_app):
+        """If ping fails on first attempts but succeeds on a later one, return RUNNING."""
+        run = _make_run()
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "STARTED"
+        result.info = {"hostname": "celery@worker-pod-1"}
+
+        # First call: no response. Second call: success.
+        inspect_fail = MagicMock()
+        inspect_fail.ping.return_value = None
+        inspect_ok = MagicMock()
+        inspect_ok.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
+        mock_celery_app.control.inspect.side_effect = [inspect_fail, inspect_ok]
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+        assert mock_sleep.call_count == 1
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_pending_then_started_and_alive_returns_running(
+        self, mock_sleep, launcher, mock_celery_app
+    ):
+        """If task is PENDING on first check but STARTED+alive on retry, return RUNNING."""
+        run = _make_run()
+        result = mock_celery_app.AsyncResult.return_value
+
+        # First call: PENDING. Second call: STARTED with alive worker.
+        result_states = iter(["PENDING", "STARTED"])
+        type(result).state = property(lambda self, _iter=result_states: next(_iter))
+        result.info = {"hostname": "celery@worker-pod-1"}
+
+        inspect_ok = MagicMock()
+        inspect_ok.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
+        mock_celery_app.control.inspect.return_value = inspect_ok
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+        assert mock_sleep.call_count == 1
+
+
+class TestExecuteJobTaskDuplicateDelivery:
+    """A broker redelivery of the run worker task must not overwrite the result
+    backend state (which run monitoring trusts) with a no-op SUCCESS.
+    """
+
+    @pytest.fixture
+    def celery_app(self):
+        return Celery("test-crash-detection")
+
+    def _run_task(self, celery_app, run_status, hostname="celery@test-worker"):
+        task = create_execute_job_task(celery_app)
+
+        mock_instance = MagicMock()
+        run = MagicMock()
+        run.run_id = "test-run-id"
+        run.status = run_status
+        mock_instance.get_run_by_id.return_value = run
+
+        with (
+            patch("dagster_celery.tasks.DagsterInstance") as mock_instance_cls,
+            patch("dagster_celery.tasks.unpack_value") as mock_unpack,
+            patch("dagster_celery.tasks._execute_run_command_body") as mock_body,
+        ):
+            mock_instance_cls.get.return_value.__enter__.return_value = mock_instance
+            mock_unpack.return_value = MagicMock(
+                run_id="test-run-id", set_exit_code_on_failure=None
+            )
+            mock_body.return_value = 0
+
+            task.push_request(hostname=hostname)
+            try:
+                task(execute_job_args_packed={})
+            finally:
+                task.pop_request()
+
+            return mock_instance, mock_body
+
+    def test_duplicate_delivery_raises_ignore_and_skips_execution(self, celery_app):
+        """Run already STARTED means another delivery of this task is (or was) executing
+        the run: raise Ignore so celery does not record this delivery as task success.
+        """
+        with pytest.raises(Ignore):
+            self._run_task(celery_app, DagsterRunStatus.STARTED)
+
+    def test_duplicate_delivery_does_not_execute_run(self, celery_app):
+        task = create_execute_job_task(celery_app)
+        mock_instance = MagicMock()
+        run = MagicMock()
+        run.status = DagsterRunStatus.STARTED
+        mock_instance.get_run_by_id.return_value = run
+
+        with (
+            patch("dagster_celery.tasks.DagsterInstance") as mock_instance_cls,
+            patch("dagster_celery.tasks.unpack_value") as mock_unpack,
+            patch("dagster_celery.tasks._execute_run_command_body") as mock_body,
+        ):
+            mock_instance_cls.get.return_value.__enter__.return_value = mock_instance
+            mock_unpack.return_value = MagicMock(
+                run_id="test-run-id", set_exit_code_on_failure=None
+            )
+            with pytest.raises(Ignore):
+                task(execute_job_args_packed={})
+            mock_body.assert_not_called()
+
+    def test_first_delivery_executes_and_tags_worker_hostname(self, celery_app):
+        mock_instance, mock_body = self._run_task(celery_app, DagsterRunStatus.STARTING)
+
+        mock_body.assert_called_once()
+        mock_instance.add_run_tags.assert_called_once_with(
+            "test-run-id",
+            {DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@test-worker"},
+        )

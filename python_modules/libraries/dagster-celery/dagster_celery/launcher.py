@@ -1,5 +1,7 @@
 import logging
+import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from celery import Celery
@@ -24,6 +26,15 @@ from dagster._grpc.types import ExecuteRunArgs, ResumeRunArgs
 from dagster._serdes import ConfigurableClass, ConfigurableClassData, pack_value
 from typing_extensions import Self, override
 
+# Retry constants for health check — absorb transient broker/inspect failures
+# before reporting UNKNOWN or FAILED to the stock monitoring daemon.
+HEALTH_CHECK_MAX_RETRIES = 3
+HEALTH_CHECK_RETRY_DELAY_SECONDS = 5.0
+
+# Task state SUCCESS with the run still unfinished is only tolerated this long
+# (the run terminal event is normally written before the task returns).
+TASK_SUCCESS_TERMINAL_GRACE_SECONDS = 60.0
+
 from dagster_celery.config import DEFAULT_CONFIG, TASK_EXECUTE_JOB_NAME, TASK_RESUME_JOB_NAME
 from dagster_celery.defaults import task_default_queue
 from dagster_celery.make_app import make_app
@@ -31,6 +42,7 @@ from dagster_celery.tags import (
     DAGSTER_CELERY_QUEUE_TAG,
     DAGSTER_CELERY_RUN_PRIORITY_TAG,
     DAGSTER_CELERY_TASK_ID_TAG,
+    DAGSTER_CELERY_WORKER_HOSTNAME_TAG,
 )
 from dagster_celery.tasks import create_execute_job_task, create_resume_job_task
 
@@ -203,33 +215,114 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         return True
 
     def check_run_worker_health(self, run: DagsterRun) -> CheckRunHealthResult:
-        """Check whether the Celery worker running this task is alive."""
+        """Check whether the Celery worker running this task is alive.
+
+        Retries transient failures (PENDING/broker errors) up to
+        HEALTH_CHECK_MAX_RETRIES times before reporting UNKNOWN to the
+        monitoring daemon, which would otherwise immediately mark the run
+        as failed.
+        """
+        logger = logging.getLogger(__name__)
         task_id = run.tags[DAGSTER_CELERY_TASK_ID_TAG]
 
-        result: AsyncResult = self.celery.AsyncResult(task_id)
-        task_status = result.state
+        last_result: CheckRunHealthResult | None = None
+        for attempt in range(1, HEALTH_CHECK_MAX_RETRIES + 1):
+            result: AsyncResult = self.celery.AsyncResult(task_id)
+            task_status = result.state
 
-        if task_status == "SUCCESS":
-            return CheckRunHealthResult(WorkerStatus.SUCCESS)
-        if task_status == "FAILURE":
-            return CheckRunHealthResult(WorkerStatus.FAILED, "Celery task failed.")
-        if task_status == "STARTED":
-            return self._check_started_task_worker_health(result)
-        # Handles the PENDING and RETRYING states.
-        return CheckRunHealthResult(WorkerStatus.UNKNOWN, f"Unknown task status: {task_status}")
+            if task_status == "SUCCESS":
+                return self._check_task_success_run_terminal(run, result)
+            if task_status == "FAILURE":
+                return CheckRunHealthResult(WorkerStatus.FAILED, "Celery task failed.")
+            if task_status == "STARTED":
+                ping_result = self._ping_worker(run, result)
+                if ping_result.status == WorkerStatus.RUNNING:
+                    return ping_result
+                # Ping failed — might be transient, retry
+                last_result = ping_result
+            else:
+                # PENDING, RETRYING, etc. PENDING may mean the result backend lost
+                # the task meta (e.g. redis restart); if the run worker tagged the
+                # run with its hostname, ping it directly instead of giving up.
+                tagged_hostname = run.tags.get(DAGSTER_CELERY_WORKER_HOSTNAME_TAG)
+                if tagged_hostname:
+                    ping_result = self._ping_hostname(tagged_hostname)
+                    if ping_result.status == WorkerStatus.RUNNING:
+                        return ping_result
+                    last_result = CheckRunHealthResult(
+                        ping_result.status,
+                        f"Task status {task_status}; {ping_result.msg}",
+                    )
+                else:
+                    last_result = CheckRunHealthResult(
+                        WorkerStatus.UNKNOWN, f"Unknown task status: {task_status}"
+                    )
 
-    def _check_started_task_worker_health(self, result: "AsyncResult") -> CheckRunHealthResult:
-        """When a task reports STARTED, verify the worker is still alive via inspect ping.
+            if attempt < HEALTH_CHECK_MAX_RETRIES:
+                logger.info(
+                    "Health check attempt %d/%d for run %s returned %s — retrying in %.0fs. %s",
+                    attempt,
+                    HEALTH_CHECK_MAX_RETRIES,
+                    run.run_id,
+                    last_result.status if last_result else "N/A",
+                    HEALTH_CHECK_RETRY_DELAY_SECONDS,
+                    last_result.msg if last_result else "",
+                )
+                time.sleep(HEALTH_CHECK_RETRY_DELAY_SECONDS)
 
-        With persistent result backends (e.g. Redis), the task state stays STARTED
-        even after the worker crashes. We use Celery's inspect API to ping the specific
-        worker and verify it's still responsive.
+        logger.warning(
+            "Health check for run %s exhausted %d retries. Final status: %s — %s",
+            run.run_id,
+            HEALTH_CHECK_MAX_RETRIES,
+            last_result.status if last_result else "N/A",
+            last_result.msg if last_result else "",
+        )
+        return last_result  # type: ignore[return-value]
+
+    def _check_task_success_run_terminal(
+        self, run: DagsterRun, result: "AsyncResult"
+    ) -> CheckRunHealthResult:
+        """Task state SUCCESS is only healthy if the run reached a terminal state.
+
+        A duplicate (redelivered) execution of the run worker task exits as a no-op
+        and overwrites the result backend with SUCCESS while the run is still in
+        flight; trusting it unconditionally leaves crashed runs STARTED forever.
         """
-        worker_hostname = self._get_worker_hostname(result)
+        current_run = self._instance.get_run_by_id(run.run_id)
+        if current_run is None or current_run.is_finished:
+            return CheckRunHealthResult(WorkerStatus.SUCCESS)
+
+        date_done = result.date_done
+        if date_done is not None:
+            if date_done.tzinfo is None:
+                date_done = date_done.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - date_done).total_seconds()
+            if elapsed < TASK_SUCCESS_TERMINAL_GRACE_SECONDS:
+                return CheckRunHealthResult(
+                    WorkerStatus.RUNNING,
+                    "Celery task succeeded; waiting for the run terminal event.",
+                )
+
+        return CheckRunHealthResult(
+            WorkerStatus.FAILED,
+            f"Celery task {result.id} reports SUCCESS but run {run.run_id} never reached a"
+            f" terminal state (status: {current_run.status}). The task result was likely"
+            " overwritten by a duplicate delivery, or the worker exited without finalizing"
+            " the run.",
+        )
+
+    def _ping_worker(self, run: DagsterRun, result: "AsyncResult") -> CheckRunHealthResult:
+        """Ping the Celery worker for a STARTED task. Single attempt, no retries.
+
+        Prefers the hostname tagged on the run by the executing worker over the
+        result-backend meta, which a duplicate delivery may have overwritten.
+        """
+        logger = logging.getLogger(__name__)
+        worker_hostname = run.tags.get(
+            DAGSTER_CELERY_WORKER_HOSTNAME_TAG
+        ) or self._get_worker_hostname(result)
         if not worker_hostname:
-            # Cannot determine worker — report as UNKNOWN so the monitoring daemon
-            # does not silently treat a potentially-dead worker as healthy.
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Cannot determine Celery worker hostname from task result. "
                 "Reporting worker status as UNKNOWN."
             )
@@ -238,6 +331,10 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                 "Cannot determine Celery worker hostname from task result.",
             )
 
+        return self._ping_hostname(worker_hostname)
+
+    def _ping_hostname(self, worker_hostname: str) -> CheckRunHealthResult:
+        logger = logging.getLogger(__name__)
         try:
             inspector = self.celery.control.inspect(
                 destination=[worker_hostname],
@@ -245,12 +342,11 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             )
             ping_response = inspector.ping()
         except Exception as e:
-            logging.getLogger(__name__).warning(
-                f"Failed to ping Celery worker {worker_hostname}: {e}. "
-                "Reporting worker status as UNKNOWN."
+            logger.warning(
+                "Failed to ping Celery worker %s: %s. Reporting worker status as UNKNOWN.",
+                worker_hostname,
+                e,
             )
-            # If we can't reach the broker to inspect, report as UNKNOWN rather
-            # than silently assuming the worker is alive.
             return CheckRunHealthResult(
                 WorkerStatus.UNKNOWN,
                 f"Failed to ping Celery worker {worker_hostname}: {e}",
