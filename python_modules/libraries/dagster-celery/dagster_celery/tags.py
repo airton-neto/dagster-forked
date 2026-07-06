@@ -9,3 +9,8 @@ DAGSTER_CELERY_QUEUE_TAG = "dagster-celery/queue"
 
 # Used to set the celery task_id for run monitoring
 DAGSTER_CELERY_TASK_ID_TAG = "dagster-celery/task_id"
+
+# Written by the run worker task when it starts executing a run. Run monitoring
+# pings this hostname; unlike the result-backend task meta, it cannot be
+# overwritten by a duplicate (redelivered) task execution on another worker.
+DAGSTER_CELERY_WORKER_HOSTNAME_TAG = "dagster-celery/worker-hostname"
