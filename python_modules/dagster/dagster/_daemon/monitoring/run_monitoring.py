@@ -251,6 +251,21 @@ def monitor_started_run(
                     )
                 logger.info(msg)
                 instance.report_run_failed(run, msg)
+                # The health check can false-positive (e.g. a ping lost to a broker
+                # brownout) while the worker is alive and mid-run; without termination
+                # it would keep executing and later overwrite FAILURE with SUCCESS.
+                try:
+                    instance.run_launcher.terminate(run_id=run.run_id)
+                except:
+                    instance.report_engine_event(
+                        "Exception while attempting to terminate run worker after marking"
+                        " the run as failed.",
+                        job_name=run.job_name,
+                        run_id=run.run_id,
+                        engine_event_data=EngineEventData(
+                            error=serializable_error_info_from_exc_info(sys.exc_info()),
+                        ),
+                    )
                 return
     check_run_timeout(
         instance, run_record, logger, float(instance.run_monitoring_max_runtime_seconds)

@@ -140,6 +140,10 @@ class SettingsMethods:
         return self.run_monitoring_settings.get("poll_interval_seconds", 120)
 
     @property
+    def run_monitoring_unknown_status_threshold(self) -> int:
+        return self.run_monitoring_settings.get("unknown_status_threshold", 3)
+
+    @property
     def cancellation_thread_poll_interval_seconds(self) -> int:
         return self.get_settings("run_monitoring").get(
             "cancellation_thread_poll_interval_seconds", 10

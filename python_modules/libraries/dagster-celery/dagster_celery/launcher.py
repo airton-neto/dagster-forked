@@ -153,6 +153,23 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         run = context.dagster_run
         job_origin = check.not_none(run.job_code_origin)
 
+        # The prior worker may still be alive — health checks can false-positive
+        # during a broker/network brownout — and two workers must not execute the
+        # same run concurrently. Best-effort: the revoke broadcast may not reach a
+        # worker that is currently partitioned from the broker.
+        prior_task_id = run.tags.get(DAGSTER_CELERY_TASK_ID_TAG)
+        if prior_task_id:
+            try:
+                prior_result: AsyncResult = self.celery.AsyncResult(prior_task_id)
+                prior_result.revoke(terminate=True)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Failed to revoke prior Celery task %s before resuming run %s.",
+                    prior_task_id,
+                    run.run_id,
+                    exc_info=True,
+                )
+
         args = ResumeRunArgs(
             job_origin=job_origin,
             run_id=run.run_id,
@@ -354,9 +371,15 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         if ping_response and isinstance(ping_response, dict) and worker_hostname in ping_response:
             return CheckRunHealthResult(WorkerStatus.RUNNING)
 
+        # An empty reply is indistinguishable from a broker/network brownout: the
+        # broadcast reply simply may not have arrived within the timeout while the
+        # worker is alive and mid-run. Report UNKNOWN so the monitoring daemon's
+        # consecutive-UNKNOWN threshold decides, instead of failing the run on a
+        # single lost ping (which strands a zombie worker that later overwrites the
+        # FAILURE status with SUCCESS).
         return CheckRunHealthResult(
-            WorkerStatus.FAILED,
-            f"Celery worker {worker_hostname} is not responding to ping.",
+            WorkerStatus.UNKNOWN,
+            f"Celery worker {worker_hostname} did not reply to ping within the timeout.",
         )
 
     @staticmethod

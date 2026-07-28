@@ -78,6 +78,59 @@ class TestResumeRun:
             )
 
 
+class TestResumeRunRevokesPriorTask:
+    """Resuming a run launches a second celery task for the same run id. The prior
+    worker may still be alive (ping health checks can false-positive during a broker
+    or network brownout), so the prior task must be revoked before the resume task is
+    submitted — otherwise two workers execute the same run concurrently.
+    """
+
+    def _resume(self, launcher, run):
+        context = ResumeRunContext(dagster_run=run, workspace=None, resume_attempt_number=1)
+        with (
+            patch("dagster_celery.launcher.create_resume_job_task") as mock_create,
+            patch("dagster_celery.launcher.ResumeRunArgs"),
+            patch("dagster_celery.launcher.pack_value"),
+            patch.object(CeleryRunLauncher, "_launch_celery_task_run"),
+        ):
+            mock_task = MagicMock()
+            mock_create.return_value = mock_task
+            launcher.resume_run(context)
+
+    def test_resume_run_revokes_prior_task(self, launcher, mock_celery_app):
+        run = _make_run(task_id="prior-task-id")
+
+        self._resume(launcher, run)
+
+        mock_celery_app.AsyncResult.assert_called_once_with("prior-task-id")
+        mock_celery_app.AsyncResult.return_value.revoke.assert_called_once_with(terminate=True)
+
+    def test_resume_run_without_prior_task_tag_does_not_revoke(self, launcher, mock_celery_app):
+        run = _make_run()
+        run.tags = {}
+
+        self._resume(launcher, run)
+
+        mock_celery_app.AsyncResult.return_value.revoke.assert_not_called()
+
+    def test_resume_run_revoke_failure_does_not_block_resume(self, launcher, mock_celery_app):
+        """A broker error while revoking must not prevent the resume from launching."""
+        run = _make_run(task_id="prior-task-id")
+        mock_celery_app.AsyncResult.return_value.revoke.side_effect = Exception("broker down")
+
+        with (
+            patch("dagster_celery.launcher.create_resume_job_task") as mock_create,
+            patch("dagster_celery.launcher.ResumeRunArgs"),
+            patch("dagster_celery.launcher.pack_value"),
+            patch.object(CeleryRunLauncher, "_launch_celery_task_run") as mock_launch,
+        ):
+            mock_create.return_value = MagicMock()
+            context = ResumeRunContext(dagster_run=run, workspace=None, resume_attempt_number=1)
+            launcher.resume_run(context)
+
+            mock_launch.assert_called_once()
+
+
 def _make_current_run(finished: bool, status=DagsterRunStatus.STARTED):
     current = MagicMock()
     current.run_id = "test-run-id"
@@ -173,9 +226,13 @@ class TestCheckRunWorkerHealth:
         )
 
     @patch("dagster_celery.launcher.time.sleep")
-    def test_pending_with_hostname_tag_dead_worker_returns_failed(
+    def test_pending_with_hostname_tag_no_ping_reply_returns_unknown(
         self, mock_sleep, launcher, mock_celery_app
     ):
+        """An empty ping reply is indistinguishable from a broker/network disruption:
+        report UNKNOWN so the monitoring daemon's consecutive-UNKNOWN threshold applies
+        instead of immediately failing the run.
+        """
         run = _make_run()
         run.tags[DAGSTER_CELERY_WORKER_HOSTNAME_TAG] = "celery@worker-pod-1"
         result = mock_celery_app.AsyncResult.return_value
@@ -186,7 +243,7 @@ class TestCheckRunWorkerHealth:
         mock_celery_app.control.inspect.return_value = inspect_mock
 
         health = launcher.check_run_worker_health(run)
-        assert health.status == WorkerStatus.FAILED
+        assert health.status == WorkerStatus.UNKNOWN
 
     def test_started_prefers_run_tag_hostname_over_result_meta(self, launcher, mock_celery_app):
         """The run tag is written by the worker that actually executes the run; the
@@ -243,10 +300,15 @@ class TestCheckRunWorkerHealth:
         assert health.status == WorkerStatus.RUNNING
 
     @patch("dagster_celery.launcher.time.sleep")
-    def test_task_started_worker_dead_retries_then_returns_failed(
+    def test_task_started_no_ping_reply_retries_then_returns_unknown(
         self, mock_sleep, launcher, mock_celery_app
     ):
-        """When worker doesn't respond to ping, retries then returns FAILED."""
+        """When the worker doesn't reply to ping, retries then returns UNKNOWN.
+
+        A 2s-timeout broadcast reply cannot distinguish a dead worker from a
+        network brownout — a live worker mid-run must not be declared FAILED
+        (which would immediately fail the run and strand a zombie task).
+        """
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "STARTED"
@@ -258,8 +320,8 @@ class TestCheckRunWorkerHealth:
         mock_celery_app.control.inspect.return_value = inspect_mock
 
         health = launcher.check_run_worker_health(run)
-        assert health.status == WorkerStatus.FAILED
-        assert "not responding" in health.msg.lower()
+        assert health.status == WorkerStatus.UNKNOWN
+        assert "did not reply to ping" in health.msg.lower()
         assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
     @patch("dagster_celery.launcher.time.sleep")
