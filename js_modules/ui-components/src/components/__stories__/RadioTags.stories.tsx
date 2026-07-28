@@ -2,7 +2,7 @@ import {useState} from 'react';
 
 import {Box} from '../Box';
 import {RadioTags} from '../RadioTags';
-import {BodySmall} from '../Text';
+import {Text} from '../Typography';
 
 // eslint-disable-next-line import/no-default-export
 export default {
@@ -11,11 +11,11 @@ export default {
 };
 
 export const Default = () => {
-  const [value, setValue] = useState('all');
+  const [value, setValue] = useState<'all' | 'active' | 'paused' | 'error'>('all');
 
   return (
     <Box flex={{direction: 'column', gap: 16}} padding={16}>
-      <BodySmall>Selected: {value}</BodySmall>
+      <Text size={12}>Selected: {value}</Text>
       <RadioTags
         name="filter"
         aria-label="Filter by status"
@@ -33,11 +33,11 @@ export const Default = () => {
 };
 
 export const WithIcons = () => {
-  const [value, setValue] = useState('list');
+  const [value, setValue] = useState<'list' | 'grid' | 'graph'>('list');
 
   return (
     <Box flex={{direction: 'column', gap: 16}} padding={16}>
-      <BodySmall>Selected: {value}</BodySmall>
+      <Text size={12}>Selected: {value}</Text>
       <RadioTags
         name="view"
         aria-label="View mode"

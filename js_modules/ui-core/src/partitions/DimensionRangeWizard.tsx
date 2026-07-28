@@ -182,7 +182,6 @@ export const DimensionRangeWizard = ({
       <JoinedButtons>
         {isTimeseries && (
           <ActivatableButton
-            as={Button}
             $active={selectState === 'latest'}
             onClick={() => {
               setSelectState('latest');
@@ -194,7 +193,6 @@ export const DimensionRangeWizard = ({
           </ActivatableButton>
         )}
         <ActivatableButton
-          as={Button}
           $active={selectState === 'all'}
           onClick={() => {
             setSelectState('all');
@@ -205,7 +203,6 @@ export const DimensionRangeWizard = ({
           All
         </ActivatableButton>
         <ActivatableButton
-          as={Button}
           $active={selectState === 'failed'}
           onClick={() => {
             setSelectState('failed');
@@ -215,7 +212,6 @@ export const DimensionRangeWizard = ({
           Failed
         </ActivatableButton>
         <ActivatableButton
-          as={Button}
           $active={selectState === 'missing'}
           onClick={() => {
             setSelectState('missing');
@@ -225,7 +221,6 @@ export const DimensionRangeWizard = ({
           Missing
         </ActivatableButton>
         <ActivatableButton
-          as={Button}
           $active={selectState === 'failed_and_missing'}
           onClick={() => {
             setSelectState('failed_and_missing');
@@ -235,7 +230,6 @@ export const DimensionRangeWizard = ({
           Failed and missing
         </ActivatableButton>
         <ActivatableButton
-          as={Button}
           $active={selectState === 'custom'}
           onClick={() => {
             setSelectState('custom');
@@ -364,14 +358,23 @@ export const DimensionRangeWizard = ({
 
 const getMissingPartitions = (health: PartitionStatusHealthSource, partitionKeys: string[]) => {
   if ('ranges' in health) {
-    const missingRangeTerms = health.ranges
-      .filter((range) => range.value.includes(AssetPartitionStatus.MISSING))
-      .map((range) => ({type: 'range' as const, start: range.start.key, end: range.end.key}));
-    const missingRangeSelections = convertToPartitionSelection(missingRangeTerms, partitionKeys);
-    if (missingRangeSelections instanceof Error) {
-      return [];
+    // Compute missing as the complement of all non-missing ranges. This handles two cases:
+    // - Time-based partitions: missing partitions are gaps (no explicit MISSING ranges)
+    // - Static partitions: explicit MISSING ranges exist alongside materialized ranges
+    // In both cases, the complement of non-missing ranges yields the missing keys.
+    const coveredKeys = new Set<string>();
+    for (const range of health.ranges) {
+      if (range.value.includes(AssetPartitionStatus.MISSING)) {
+        continue;
+      }
+      for (let i = range.start.idx; i <= range.end.idx; i++) {
+        const key = partitionKeys[i];
+        if (key !== undefined) {
+          coveredKeys.add(key);
+        }
+      }
     }
-    return missingRangeSelections.selectedKeys;
+    return partitionKeys.filter((key) => !coveredKeys.has(key));
   }
   return partitionKeys.filter(
     (key, idx) => health.runStatusForPartitionKey(key, idx) === undefined,

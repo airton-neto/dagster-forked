@@ -83,12 +83,13 @@ class MockRunLauncher(RunLauncher, ConfigurableClass):
     def supports_check_run_worker_health(self):
         return True
 
-    def check_run_worker_health(self, _run):  # pyright: ignore[reportIncompatibleMethodOverride]
-        return (
-            CheckRunHealthResult(WorkerStatus.RUNNING, "")
-            if os.environ.get("DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT") == "healthy"
-            else CheckRunHealthResult(WorkerStatus.NOT_FOUND, "")
-        )
+    def check_run_worker_health(self, _run):  # ty: ignore[invalid-method-override]
+        health_check_result = os.environ.get("DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT")
+        if health_check_result == "healthy":
+            return CheckRunHealthResult(WorkerStatus.RUNNING, "")
+        if health_check_result == "unknown":
+            return CheckRunHealthResult(WorkerStatus.UNKNOWN, "")
+        return CheckRunHealthResult(WorkerStatus.NOT_FOUND, "")
 
 
 @pytest.fixture
@@ -332,6 +333,125 @@ def test_monitor_started(
     assert run_launcher.resume_run_calls == 3
 
 
+def test_monitor_started_mark_failed_terminates_run_worker(
+    instance: DagsterInstance, workspace_context: WorkspaceProcessContext, logger: Logger
+):
+    """Marking a run failed after an unhealthy worker check must also terminate the
+    run worker: health checks can false-positive (e.g. a ping lost to a network
+    brownout), and a still-alive worker would keep executing and later overwrite the
+    FAILURE status with SUCCESS.
+    """
+    run_id = create_run_for_test(instance, job_name="foo", status=DagsterRunStatus.STARTED).run_id
+    run_record = instance.get_run_record_by_id(run_id)
+    assert run_record is not None
+    workspace = workspace_context.create_request_context()
+    run_launcher = cast("MockRunLauncher", instance.run_launcher)
+
+    # 3 resume attempts, then the 4th check marks the run failed
+    for _ in range(3):
+        monitor_started_run(instance, workspace, run_record, logger)
+    assert run_launcher.termination_calls == []
+
+    monitor_started_run(instance, workspace, run_record, logger)
+    run = instance.get_run_by_id(run_id)
+    assert run
+    assert run.status == DagsterRunStatus.FAILURE
+    assert run_launcher.termination_calls == [run_id]
+
+
+def test_monitor_started_mark_failed_termination_error_still_fails_run(
+    instance: DagsterInstance, workspace_context: WorkspaceProcessContext, logger: Logger
+):
+    run_id = create_run_for_test(instance, job_name="foo", status=DagsterRunStatus.STARTED).run_id
+    run_record = instance.get_run_record_by_id(run_id)
+    assert run_record is not None
+    workspace = workspace_context.create_request_context()
+    run_launcher = cast("MockRunLauncher", instance.run_launcher)
+    run_launcher.should_except_termination = True
+
+    for _ in range(4):
+        monitor_started_run(instance, workspace, run_record, logger)
+
+    run = instance.get_run_by_id(run_id)
+    assert run
+    assert run.status == DagsterRunStatus.FAILURE
+    assert run_launcher.termination_calls == [run_id]
+
+
+def test_monitor_started_unknown_status_waits_for_threshold(
+    instance: DagsterInstance, workspace_context: WorkspaceProcessContext, logger: Logger
+):
+    """UNKNOWN worker health must not trigger resume/fail until the configured number
+    of consecutive UNKNOWN checks is reached (default threshold: 3).
+    """
+    run_id = create_run_for_test(instance, job_name="foo", status=DagsterRunStatus.STARTED).run_id
+    run_record = instance.get_run_record_by_id(run_id)
+    assert run_record is not None
+    workspace = workspace_context.create_request_context()
+    run_launcher = cast("MockRunLauncher", instance.run_launcher)
+
+    assert instance.run_monitoring_unknown_status_threshold == 3
+
+    with environ({"DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT": "unknown"}):
+        for _ in range(2):
+            monitor_started_run(instance, workspace, run_record, logger)
+            run = instance.get_run_by_id(run_id)
+            assert run
+            assert run.status == DagsterRunStatus.STARTED
+            assert run_launcher.resume_run_calls == 0
+
+    # A healthy check resets the consecutive-UNKNOWN streak: two more UNKNOWN
+    # cycles afterwards must NOT reach the threshold (2 + 2 without the reset would)
+    with environ({"DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT": "healthy"}):
+        monitor_started_run(instance, workspace, run_record, logger)
+    with environ({"DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT": "unknown"}):
+        for _ in range(2):
+            monitor_started_run(instance, workspace, run_record, logger)
+            run = instance.get_run_by_id(run_id)
+            assert run
+            assert run.status == DagsterRunStatus.STARTED
+            assert run_launcher.resume_run_calls == 0
+
+        # The third consecutive UNKNOWN after the reset reaches the threshold
+        monitor_started_run(instance, workspace, run_record, logger)
+        run = instance.get_run_by_id(run_id)
+        assert run
+        assert run.status == DagsterRunStatus.STARTED
+        assert run_launcher.resume_run_calls == 1
+
+
+def test_monitor_started_unknown_status_threshold_configurable(logger: Logger):
+    with dg.instance_for_test(
+        overrides={
+            "run_launcher": {
+                "module": "dagster_tests.daemon_tests.test_monitoring_daemon",
+                "class": "MockRunLauncher",
+            },
+            "run_monitoring": {
+                "enabled": True,
+                "max_resume_run_attempts": 3,
+                "unknown_status_threshold": 1,
+            },
+        },
+    ) as instance:
+        with create_test_daemon_workspace_context(
+            workspace_load_target=EmptyWorkspaceTarget(), instance=instance
+        ) as workspace_context:
+            run_id = create_run_for_test(
+                instance, job_name="foo", status=DagsterRunStatus.STARTED
+            ).run_id
+            run_record = instance.get_run_record_by_id(run_id)
+            assert run_record is not None
+            workspace = workspace_context.create_request_context()
+            run_launcher = cast("MockRunLauncher", instance.run_launcher)
+
+            assert instance.run_monitoring_unknown_status_threshold == 1
+
+            with environ({"DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT": "unknown"}):
+                monitor_started_run(instance, workspace, run_record, logger)
+            assert run_launcher.resume_run_calls == 1
+
+
 def test_long_running_termination(
     instance: DagsterInstance, workspace_context: WorkspaceProcessContext, logger: Logger
 ):
@@ -417,13 +537,26 @@ def test_long_running_termination(
             assert run
             assert run.status == DagsterRunStatus.FAILURE
 
+            # The fork's check_run_timeout reports RUN_CANCELING (with the runtime
+            # reason), terminates the worker, then force-marks the run as failed.
+            canceling_events = instance.all_logs(
+                too_long_record.dagster_run.run_id, of_type=DagsterEventType.RUN_CANCELING
+            )
+            assert len(canceling_events) == 1
+            canceling_event = canceling_events[0].dagster_event
+            assert canceling_event
+            assert "exceeding maximum runtime of 500 seconds" in canceling_event.message
+
             run_failure_events = instance.all_logs(
                 too_long_record.dagster_run.run_id, of_type=DagsterEventType.RUN_FAILURE
             )
             assert len(run_failure_events) == 1
             event = run_failure_events[0].dagster_event
             assert event
-            assert event.message == "Exceeded maximum runtime of 500 seconds."
+            assert event.message == (
+                "This job is being forcibly marked as failed. The computational resources"
+                " created by the run may not have been fully cleaned up."
+            )
 
             monitor_started_run(instance, workspace, too_long_other_tag_value_record, logger)
             run = instance.get_run_by_id(too_long_other_tag_value_record.dagster_run.run_id)
@@ -433,6 +566,15 @@ def test_long_running_termination(
             assert run
             assert run.status == DagsterRunStatus.FAILURE
 
+            canceling_events = instance.all_logs(
+                too_long_other_tag_value_record.dagster_run.run_id,
+                of_type=DagsterEventType.RUN_CANCELING,
+            )
+            assert len(canceling_events) == 1
+            canceling_event = canceling_events[0].dagster_event
+            assert canceling_event
+            assert "exceeding maximum runtime of 500 seconds" in canceling_event.message
+
             run_failure_events = instance.all_logs(
                 too_long_other_tag_value_record.dagster_run.run_id,
                 of_type=DagsterEventType.RUN_FAILURE,
@@ -440,7 +582,10 @@ def test_long_running_termination(
             assert len(run_failure_events) == 1
             event = run_failure_events[0].dagster_event
             assert event
-            assert event.message == "Exceeded maximum runtime of 500 seconds."
+            assert event.message == (
+                "This job is being forcibly marked as failed. The computational resources"
+                " created by the run may not have been fully cleaned up."
+            )
 
         # Wait long enough for the instance default to kick in
         eval_time = started_time + datetime.timedelta(seconds=751)

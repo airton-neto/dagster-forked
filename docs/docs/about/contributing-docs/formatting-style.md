@@ -47,6 +47,10 @@ Available admonitions:
 - `:::warning`
 - `:::danger`
 
+Always include a blank line after the admonition label and before the closing set of colons.
+
+### Admonition titles
+
 You can specify an optional title (with Markdown syntax) for admonitions (note that you do not need to include brackets -- unclear why Docusaurus is adding them when rendering the code block below, but they are unnecessary in Dagster docs):
 
 ```
@@ -201,7 +205,7 @@ When referencing a subset of lines from a file, use the `startAfter` and `endBef
 
 ```sh
 <CodeExample
-  path="docs_snippets/docs_snippets/concepts/assets/multi_component_asset_key.py"
+  path="docs_snippets/docs_snippets/guides/build/assets/multi_component_asset_key.py"
   startAfter="start_marker"
   endBefore="end_marker"
 />
@@ -506,7 +510,7 @@ The `sidebar_custom_props` values are used to render the doc cards on the integr
 
 - The names of programming languages (`Python`, `Rust`) should follow the official style guidelines for that language.
 
-### **Key terms and definitions**
+### Key terms and definitions
 
 | **Term**                      | **Definition**                                                                                                                                       | **Notes**                                                                                                                                             | **Formatting** |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |

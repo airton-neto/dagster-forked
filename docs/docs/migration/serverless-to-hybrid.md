@@ -63,10 +63,9 @@ Update your build process to publish a new container image and configuration for
 
 ## Step 6: Replace Serverless-only features with their Hybrid equivalents
 
-| Serverless-only feature                                                                                                                                          | Hybrid equivalent                                                                                                                                                                                                                                                                                                         |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Disabling PEX-based deploys](/deployment/dagster-plus/serverless/runtime-environment#disable-pex-deploys) and customizing the Docker image with lifecycle hooks | To customize a code location's runtime environment, you can customize the code location's [Dockerfile](https://github.com/dagster-io/dagster-cloud-hybrid-quickstart/blob/main/Dockerfile) to build its image.                                                                                                            |
-| Enabling [non-isolated runs](/deployment/dagster-plus/serverless/run-isolation#non-isolated-runs)                                                                | While this feature doesn't have a direct Hybrid equivalent, you can experiment with the <PyObject section="execution" module="dagster" object="in_process_executor" /> or <PyObject section="execution" module="dagster" object="multiprocess_executor" /> for specific jobs or entire code locations to reduce overhead. |
+| Serverless-only feature                                                                                                                                          | Hybrid equivalent                                                                                                                                                                                              |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Disabling PEX-based deploys](/deployment/dagster-plus/serverless/runtime-environment#disable-pex-deploys) and customizing the Docker image with lifecycle hooks | To customize a code location's runtime environment, you can customize the code location's [Dockerfile](https://github.com/dagster-io/dagster-cloud-hybrid-quickstart/blob/main/Dockerfile) to build its image. |
 
 ## 7. Migrate asset data to your own storage (optional)
 
@@ -77,7 +76,7 @@ You can use <PyObject section="io-managers" module="dagster" object="migrate_io_
 The example below shows a job that migrates asset data from the default IO manager (which in Serverless is Dagster-managed S3 storage) to a new S3 bucket that you control:
 
 <CodeExample
-  path="docs_snippets/docs_snippets/guides/migrations/migrate_io_storage.py"
+  path="docs_snippets/docs_snippets/migration/migrate_io_storage.py"
   language="python"
   startAfter="start_migrate_io_storage"
   endBefore="end_migrate_io_storage"

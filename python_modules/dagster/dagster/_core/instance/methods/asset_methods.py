@@ -150,7 +150,7 @@ class AssetMethods:
         from dagster._core.instance.utils import RUNLESS_JOB_NAME, RUNLESS_RUN_ID
 
         self._event_storage_impl.wipe_asset_partitions(asset_key, partition_keys)
-        self.report_dagster_event(  # type: ignore[attr-defined]
+        self.report_dagster_event(  # ty: ignore[unresolved-attribute]
             DagsterEvent(
                 event_type_value=DagsterEventType.ASSET_WIPED.value,
                 event_specific_data=AssetWipedData(
@@ -317,7 +317,7 @@ class AssetMethods:
                 " AssetMaterialization, AssetObservation, AssetCheckEvaluation, FreshnessStateEvaluation or FreshnessStateChange"
             )
 
-        return self.report_dagster_event(  # type: ignore[attr-defined]
+        return self.report_dagster_event(  # ty: ignore[unresolved-attribute]
             run_id=RUNLESS_RUN_ID,
             dagster_event=DagsterEvent(
                 event_type_value=event_type_value,
@@ -393,7 +393,7 @@ class AssetMethods:
         if is_source is True:
             # this is a source asset, fetch latest observation record
             return next(
-                iter(self.fetch_observations(records_filter, limit=1).records),  # type: ignore[attr-defined]
+                iter(self.fetch_observations(records_filter, limit=1).records),  # ty: ignore[unresolved-attribute]
                 None,
             )
 
@@ -418,7 +418,7 @@ class AssetMethods:
             if materialization:
                 return materialization
             return next(
-                iter(self.fetch_observations(records_filter, limit=1).records),  # type: ignore[attr-defined]
+                iter(self.fetch_observations(records_filter, limit=1).records),  # ty: ignore[unresolved-attribute]
                 None,
             )
 
@@ -455,6 +455,10 @@ class AssetMethods:
     def internal_asset_freshness_enabled(self) -> bool:
         """Check if internal asset freshness is enabled - moved from AssetMixin.internal_asset_freshness_enabled()."""
         return os.getenv("DAGSTER_ASSET_FRESHNESS_ENABLED", "").lower() != "false"
+
+    def automation_resolve_asset_check_keys_enabled(self) -> bool:
+        """Whether declarative automation explicitly resolves the asset checks recorded on its run requests."""
+        return os.getenv("DAGSTER_AUTOMATION_RESOLVE_ASSET_CHECK_KEYS", "").lower() == "true"
 
     def streamline_read_asset_health_supported(self, streamline_name: StreamlineName) -> bool:
         """Check if streamline read asset health is supported - moved from AssetMixin.streamline_read_asset_health_supported()."""
@@ -574,7 +578,7 @@ class AssetMethods:
         asset_key: AssetKey,
         partition_keys: Sequence[str],
         partitions_def: "PartitionsDefinition",
-    ) -> Mapping[str, "AssetPartitionStatus"] | None:
+    ) -> Mapping[str, "AssetPartitionStatus | None"] | None:
         """Get the current status of provided partition_keys for the provided asset.
         Moved from AssetDomain.get_status_by_partition().
 
@@ -680,7 +684,7 @@ class AssetMethods:
         check.list_param(asset_keys, "asset_keys", of_type=AssetKey)
         for asset_key in asset_keys:
             self._event_storage_impl.wipe_asset(asset_key)
-            self.report_dagster_event(  # type: ignore[attr-defined]
+            self.report_dagster_event(  # ty: ignore[unresolved-attribute]
                 DagsterEvent(
                     event_type_value=DagsterEventType.ASSET_WIPED.value,
                     event_specific_data=AssetWipedData(asset_key=asset_key, partition_keys=None),

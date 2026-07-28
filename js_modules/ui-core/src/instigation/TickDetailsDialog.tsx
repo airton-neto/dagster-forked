@@ -6,10 +6,10 @@ import {
   Dialog,
   DialogFooter,
   DialogHeader,
+  Heading,
   MiddleTruncate,
   NonIdealState,
   SpinnerWithText,
-  Subtitle2,
   Table,
   Tag,
 } from '@dagster-io/ui-components';
@@ -18,6 +18,7 @@ import {useMemo} from 'react';
 import {RunList, TargetedRunList} from './InstigationTick';
 import {HISTORY_TICK_FRAGMENT} from './InstigationUtils';
 import {TickMaterializationsTable} from './TickMaterializationsTable';
+import {getTickResultType} from './util';
 import {gql, useQuery} from '../apollo-client';
 import {HistoryTickFragment} from './types/InstigationUtils.types';
 import {SelectedTickQuery, SelectedTickQueryVariables} from './types/TickDetailsDialog.types';
@@ -32,38 +33,28 @@ import {
   InstigationSelector,
   InstigationTickStatus,
 } from '../graphql/types';
+import {TimestampDisplay} from '../schedules/TimestampDisplay';
+import {TickResultType} from '../ticks/TickStatusTag';
 type DynamicPartitionsRequestResult = {
   partitionKeys: string[] | null;
   partitionsDefName: string;
   skippedPartitionKeys: string[];
   type: DynamicPartitionsRequestType;
 };
-import {TimestampDisplay} from '../schedules/TimestampDisplay';
-import {TickResultType} from '../ticks/TickStatusTag';
 
 interface DialogProps extends InnerProps {
   onClose: () => void;
   isOpen: boolean;
 }
 
-export const TickDetailsDialog = ({
-  tickId,
-  tickResultType,
-  isOpen,
-  instigationSelector,
-  onClose,
-}: DialogProps) => {
+export const TickDetailsDialog = ({tickId, isOpen, instigationSelector, onClose}: DialogProps) => {
   return (
     <Dialog
       isOpen={isOpen}
       onClose={onClose}
       style={{width: '80vw', maxWidth: '1200px', minWidth: '600px'}}
     >
-      <TickDetailsDialogImpl
-        tickId={tickId}
-        tickResultType={tickResultType}
-        instigationSelector={instigationSelector}
-      />
+      <TickDetailsDialogImpl tickId={tickId} instigationSelector={instigationSelector} />
       <DialogFooter topBorder>
         <Button onClick={onClose}>Close</Button>
       </DialogFooter>
@@ -73,11 +64,10 @@ export const TickDetailsDialog = ({
 
 interface InnerProps {
   tickId: string | undefined;
-  tickResultType: TickResultType;
   instigationSelector: InstigationSelector;
 }
 
-const TickDetailsDialogImpl = ({tickId, tickResultType, instigationSelector}: InnerProps) => {
+const TickDetailsDialogImpl = ({tickId, instigationSelector}: InnerProps) => {
   const {data, loading} = useQuery<SelectedTickQuery, SelectedTickQueryVariables>(
     JOB_SELECTED_TICK_QUERY,
     {
@@ -131,6 +121,8 @@ const TickDetailsDialogImpl = ({tickId, tickResultType, instigationSelector}: In
     );
   }
 
+  const resultType = getTickResultType(tick);
+
   return (
     <>
       <DialogHeader
@@ -145,15 +137,17 @@ const TickDetailsDialogImpl = ({tickId, tickResultType, instigationSelector}: In
         }
       />
       <Box padding={{vertical: 12, horizontal: 24}} border="bottom">
-        <TickDetailSummary tick={tick} tickResultType={tickResultType} />
+        <TickDetailSummary tick={tick} tickResultType={resultType} />
       </Box>
-      {tickResultType === 'materializations' ? <TickMaterializationsTable tick={tick} /> : null}
-      {tickResultType === 'runs' ? (
+      {resultType === 'materializations' ? <TickMaterializationsTable tick={tick} /> : null}
+      {resultType === 'runs' ? (
         <div style={{height: '500px', overflowY: 'auto'}}>
           {tick.runIds.length ? (
             <>
               <Box padding={{vertical: 16, horizontal: 24}} border="bottom">
-                <Subtitle2>Requested runs</Subtitle2>
+                <Heading size={14} weight={600}>
+                  Requested runs
+                </Heading>
               </Box>
               <RunList runIds={tick.runIds} />
             </>
@@ -163,7 +157,9 @@ const TickDetailsDialogImpl = ({tickId, tickResultType, instigationSelector}: In
           {addedPartitionRequests?.length ? (
             <>
               <Box padding={{vertical: 12, horizontal: 24}} border="bottom">
-                <Subtitle2>Added partitions</Subtitle2>
+                <Heading size={14} weight={600}>
+                  Added partitions
+                </Heading>
               </Box>
               <PartitionsTable partitions={addedPartitionRequests} />
             </>
@@ -171,7 +167,9 @@ const TickDetailsDialogImpl = ({tickId, tickResultType, instigationSelector}: In
           {deletedPartitionRequests?.length ? (
             <>
               <Box padding={{vertical: 12, horizontal: 24}} border="bottom">
-                <Subtitle2>Deleted partitions</Subtitle2>
+                <Heading size={14} weight={600}>
+                  Deleted partitions
+                </Heading>
               </Box>
               <PartitionsTable partitions={deletedPartitionRequests} />
             </>
@@ -215,7 +213,9 @@ export function TickDetailSummary({
     <>
       <div style={{display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12}}>
         <Box flex={{direction: 'column', gap: 4}}>
-          <Subtitle2>Status</Subtitle2>
+          <Heading size={14} weight={600}>
+            Status
+          </Heading>
           <Box flex={{direction: 'row', gap: 4, alignItems: 'center'}}>
             <Tag intent={intent}>
               {tick.status === InstigationTickStatus.STARTED ? (
@@ -245,7 +245,9 @@ export function TickDetailSummary({
           </Box>
         </Box>
         <Box flex={{direction: 'column', gap: 4}}>
-          <Subtitle2>Timestamp</Subtitle2>
+          <Heading size={14} weight={600}>
+            Timestamp
+          </Heading>
           <div>
             {tick ? (
               <Timestamp timestamp={{unix: tick.timestamp}} timeFormat={{showTimezone: true}} />
@@ -255,7 +257,9 @@ export function TickDetailSummary({
           </div>
         </Box>
         <Box flex={{direction: 'column', gap: 4}}>
-          <Subtitle2>Duration</Subtitle2>
+          <Heading size={14} weight={600}>
+            Duration
+          </Heading>
           <div>
             {tick?.endTimestamp
               ? formatElapsedTimeWithoutMsec(tick.endTimestamp * 1000 - tick.timestamp * 1000)
