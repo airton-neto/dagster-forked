@@ -537,13 +537,26 @@ def test_long_running_termination(
             assert run
             assert run.status == DagsterRunStatus.FAILURE
 
+            # The fork's check_run_timeout reports RUN_CANCELING (with the runtime
+            # reason), terminates the worker, then force-marks the run as failed.
+            canceling_events = instance.all_logs(
+                too_long_record.dagster_run.run_id, of_type=DagsterEventType.RUN_CANCELING
+            )
+            assert len(canceling_events) == 1
+            canceling_event = canceling_events[0].dagster_event
+            assert canceling_event
+            assert "exceeding maximum runtime of 500 seconds" in canceling_event.message
+
             run_failure_events = instance.all_logs(
                 too_long_record.dagster_run.run_id, of_type=DagsterEventType.RUN_FAILURE
             )
             assert len(run_failure_events) == 1
             event = run_failure_events[0].dagster_event
             assert event
-            assert event.message == "Exceeded maximum runtime of 500 seconds."
+            assert event.message == (
+                "This job is being forcibly marked as failed. The computational resources"
+                " created by the run may not have been fully cleaned up."
+            )
 
             monitor_started_run(instance, workspace, too_long_other_tag_value_record, logger)
             run = instance.get_run_by_id(too_long_other_tag_value_record.dagster_run.run_id)
@@ -553,6 +566,15 @@ def test_long_running_termination(
             assert run
             assert run.status == DagsterRunStatus.FAILURE
 
+            canceling_events = instance.all_logs(
+                too_long_other_tag_value_record.dagster_run.run_id,
+                of_type=DagsterEventType.RUN_CANCELING,
+            )
+            assert len(canceling_events) == 1
+            canceling_event = canceling_events[0].dagster_event
+            assert canceling_event
+            assert "exceeding maximum runtime of 500 seconds" in canceling_event.message
+
             run_failure_events = instance.all_logs(
                 too_long_other_tag_value_record.dagster_run.run_id,
                 of_type=DagsterEventType.RUN_FAILURE,
@@ -560,7 +582,10 @@ def test_long_running_termination(
             assert len(run_failure_events) == 1
             event = run_failure_events[0].dagster_event
             assert event
-            assert event.message == "Exceeded maximum runtime of 500 seconds."
+            assert event.message == (
+                "This job is being forcibly marked as failed. The computational resources"
+                " created by the run may not have been fully cleaned up."
+            )
 
         # Wait long enough for the instance default to kick in
         eval_time = started_time + datetime.timedelta(seconds=751)
