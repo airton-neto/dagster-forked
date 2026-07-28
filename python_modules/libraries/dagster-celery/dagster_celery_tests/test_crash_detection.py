@@ -2,12 +2,17 @@ import weakref
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import dagster as dg
 import pytest
 from celery import Celery
 from celery.exceptions import Ignore
 from dagster import DagsterRunStatus
 from dagster._core.launcher import WorkerStatus
 from dagster._core.launcher.base import ResumeRunContext
+from dagster._core.test_utils import create_run_for_test, create_test_daemon_workspace_context
+from dagster._core.workspace.load_target import EmptyWorkspaceTarget
+from dagster._daemon import get_default_daemon_logger
+from dagster._daemon.monitoring.run_monitoring import count_resume_run_attempts, monitor_started_run
 from dagster_celery.launcher import (
     HEALTH_CHECK_MAX_RETRIES,
     TASK_SUCCESS_TERMINAL_GRACE_SECONDS,
@@ -470,3 +475,121 @@ class TestExecuteJobTaskDuplicateDelivery:
             "test-run-id",
             {DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@test-worker"},
         )
+
+
+class TestIncidentReplayBrokerBrownout:
+    """Replay of the 2026-07-28 incident: a short cluster DNS/network brownout made
+    inspect.ping() return empty replies for workers that were alive and mid-run. The
+    monitoring daemon failed the live run, burned all auto-retries the same way, and
+    the never-terminated original task later overwrote FAILURE with SUCCESS.
+
+    These tests wire the real CeleryRunLauncher health check into the real
+    monitor_started_run daemon logic (only celery itself is mocked).
+    """
+
+    def _setup(self, instance, mock_app, hostname="celery@worker-daily-0"):
+        run = create_run_for_test(
+            instance,
+            job_name="Energia_dos_Ventos_Daily",
+            status=DagsterRunStatus.STARTED,
+            tags={
+                DAGSTER_CELERY_TASK_ID_TAG: "task-1",
+                DAGSTER_CELERY_WORKER_HOSTNAME_TAG: hostname,
+            },
+        )
+        result = mock_app.AsyncResult.return_value
+        result.state = "STARTED"
+        result.info = {"hostname": hostname}
+        instance.run_launcher.celery = mock_app
+        return run, instance.get_run_record_by_id(run.run_id)
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_short_brownout_does_not_fail_live_run(self, _mock_sleep):
+        """A brownout spanning fewer monitoring cycles than the UNKNOWN threshold must
+        leave the run untouched, so the live worker finishes it normally.
+        """
+        mock_app = MagicMock()
+        brownout = MagicMock()
+        brownout.ping.return_value = {}
+        healthy = MagicMock()
+        healthy.ping.return_value = {"celery@worker-daily-0": {"ok": "pong"}}
+
+        with (
+            dg.instance_for_test(
+                overrides={
+                    "run_launcher": {
+                        "module": "dagster_celery.launcher",
+                        "class": "CeleryRunLauncher",
+                    },
+                    "run_monitoring": {"enabled": True, "max_resume_run_attempts": 1},
+                },
+            ) as instance,
+            create_test_daemon_workspace_context(
+                workspace_load_target=EmptyWorkspaceTarget(), instance=instance
+            ) as workspace_process_context,
+        ):
+            logger = get_default_daemon_logger("MonitoringDaemon")
+            workspace = workspace_process_context.create_request_context()
+            run, run_record = self._setup(instance, mock_app)
+
+            # Two monitoring cycles inside the brownout window (the incident brownout
+            # lasted ~3 minutes = at most 2 cycles at the default 120s poll interval)
+            mock_app.control.inspect.return_value = brownout
+            for _ in range(2):
+                monitor_started_run(instance, workspace, run_record, logger)
+                current = instance.get_run_by_id(run.run_id)
+                assert current is not None
+                assert current.status == DagsterRunStatus.STARTED
+
+            # Network recovers; the next cycle sees the worker alive
+            mock_app.control.inspect.return_value = healthy
+            monitor_started_run(instance, workspace, run_record, logger)
+
+            current = instance.get_run_by_id(run.run_id)
+            assert current is not None
+            assert current.status == DagsterRunStatus.STARTED
+            assert count_resume_run_attempts(instance, run.run_id) == 0
+            mock_app.AsyncResult.return_value.revoke.assert_not_called()
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_sustained_outage_fails_run_and_revokes_task(self, _mock_sleep):
+        """When the outage persists past the UNKNOWN threshold and resume attempts are
+        exhausted, the run is failed AND its celery task is revoked — a still-alive
+        worker can no longer keep executing and overwrite FAILURE with SUCCESS.
+        """
+        mock_app = MagicMock()
+        brownout = MagicMock()
+        brownout.ping.return_value = {}
+
+        with (
+            dg.instance_for_test(
+                overrides={
+                    "run_launcher": {
+                        "module": "dagster_celery.launcher",
+                        "class": "CeleryRunLauncher",
+                    },
+                    "run_monitoring": {"enabled": True, "max_resume_run_attempts": 0},
+                },
+            ) as instance,
+            create_test_daemon_workspace_context(
+                workspace_load_target=EmptyWorkspaceTarget(), instance=instance
+            ) as workspace_process_context,
+        ):
+            logger = get_default_daemon_logger("MonitoringDaemon")
+            workspace = workspace_process_context.create_request_context()
+            run, run_record = self._setup(instance, mock_app)
+
+            mock_app.control.inspect.return_value = brownout
+            # Cycles 1-2: below the UNKNOWN threshold, run untouched
+            for _ in range(2):
+                monitor_started_run(instance, workspace, run_record, logger)
+                current = instance.get_run_by_id(run.run_id)
+                assert current is not None
+                assert current.status == DagsterRunStatus.STARTED
+
+            # Cycle 3: threshold reached — run failed and the task revoked
+            monitor_started_run(instance, workspace, run_record, logger)
+            current = instance.get_run_by_id(run.run_id)
+            assert current is not None
+            assert current.status == DagsterRunStatus.FAILURE
+            mock_app.AsyncResult.return_value.revoke.assert_called_once_with(terminate=True)
