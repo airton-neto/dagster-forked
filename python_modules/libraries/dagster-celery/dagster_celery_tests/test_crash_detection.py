@@ -40,6 +40,8 @@ def launcher(mock_celery_app):
         obj._instance_weakref = weakref.ref(mock_instance)  # noqa: SLF001
         obj._mock_instance_ref = mock_instance  # noqa: SLF001  # keep strong ref alive
         obj.default_queue = "dagster"
+        obj.worker_health_confirmation_cycles = 3
+        obj._worker_health_strikes = {}  # noqa: SLF001
         return obj
 
 
@@ -254,12 +256,12 @@ class TestCheckRunWorkerHealth:
         )
 
     @patch("dagster_celery.launcher.time.sleep")
-    def test_pending_with_hostname_tag_no_ping_reply_returns_unknown(
+    def test_pending_with_hostname_tag_no_ping_reply_returns_running_unconfirmed(
         self, mock_sleep, launcher, mock_celery_app
     ):
         """An empty ping reply is indistinguishable from a broker/network disruption:
-        report UNKNOWN so the monitoring daemon's consecutive-UNKNOWN threshold applies
-        instead of immediately failing the run.
+        report RUNNING (unconfirmed) so stock-core monitoring — which fails runs on any
+        non-RUNNING status — takes no action until the strike threshold confirms it.
         """
         run = _make_run()
         run.tags[DAGSTER_CELERY_WORKER_HOSTNAME_TAG] = "celery@worker-pod-1"
@@ -271,7 +273,8 @@ class TestCheckRunWorkerHealth:
         mock_celery_app.control.inspect.return_value = inspect_mock
 
         health = launcher.check_run_worker_health(run)
-        assert health.status == WorkerStatus.UNKNOWN
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in health.msg.lower()
 
     def test_started_prefers_run_tag_hostname_over_result_meta(self, launcher, mock_celery_app):
         """The run tag is written by the worker that actually executes the run; the
@@ -302,14 +305,17 @@ class TestCheckRunWorkerHealth:
         assert health.status == WorkerStatus.FAILED
 
     @patch("dagster_celery.launcher.time.sleep")
-    def test_task_pending_retries_then_returns_unknown(self, mock_sleep, launcher, mock_celery_app):
-        """PENDING status retries HEALTH_CHECK_MAX_RETRIES times before returning UNKNOWN."""
+    def test_task_pending_retries_then_returns_running_unconfirmed(
+        self, mock_sleep, launcher, mock_celery_app
+    ):
+        """PENDING retries HEALTH_CHECK_MAX_RETRIES times, then counts a strike."""
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "PENDING"
 
         health = launcher.check_run_worker_health(run)
-        assert health.status == WorkerStatus.UNKNOWN
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in health.msg.lower()
         assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
     def test_task_started_worker_alive_returns_running(self, launcher, mock_celery_app):
@@ -328,10 +334,10 @@ class TestCheckRunWorkerHealth:
         assert health.status == WorkerStatus.RUNNING
 
     @patch("dagster_celery.launcher.time.sleep")
-    def test_task_started_no_ping_reply_retries_then_returns_unknown(
+    def test_task_started_no_ping_reply_retries_then_returns_running_unconfirmed(
         self, mock_sleep, launcher, mock_celery_app
     ):
-        """When the worker doesn't reply to ping, retries then returns UNKNOWN.
+        """When the worker doesn't reply to ping, retries then reports RUNNING (unconfirmed).
 
         A 2s-timeout broadcast reply cannot distinguish a dead worker from a
         network brownout — a live worker mid-run must not be declared FAILED
@@ -348,30 +354,30 @@ class TestCheckRunWorkerHealth:
         mock_celery_app.control.inspect.return_value = inspect_mock
 
         health = launcher.check_run_worker_health(run)
-        assert health.status == WorkerStatus.UNKNOWN
+        assert health.status == WorkerStatus.RUNNING
         assert "did not reply to ping" in health.msg.lower()
         assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
     @patch("dagster_celery.launcher.time.sleep")
-    def test_task_started_no_worker_info_retries_then_returns_unknown(
+    def test_task_started_no_worker_info_retries_then_returns_running_unconfirmed(
         self, mock_sleep, launcher, mock_celery_app
     ):
-        """When worker hostname is unavailable, retries then reports UNKNOWN."""
+        """When worker hostname is unavailable, retries then reports RUNNING (unconfirmed)."""
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "STARTED"
         result.info = None
 
         health = launcher.check_run_worker_health(run)
-        assert health.status == WorkerStatus.UNKNOWN
+        assert health.status == WorkerStatus.RUNNING
         assert "hostname" in health.msg.lower()
         assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
     @patch("dagster_celery.launcher.time.sleep")
-    def test_task_started_inspect_raises_retries_then_returns_unknown(
+    def test_task_started_inspect_raises_retries_then_returns_running_unconfirmed(
         self, mock_sleep, launcher, mock_celery_app
     ):
-        """When inspect API fails (broker issue), retries then reports UNKNOWN."""
+        """When inspect API fails (broker issue), retries then reports RUNNING (unconfirmed)."""
         run = _make_run()
         result = mock_celery_app.AsyncResult.return_value
         result.state = "STARTED"
@@ -381,7 +387,7 @@ class TestCheckRunWorkerHealth:
         mock_celery_app.control.inspect.side_effect = Exception("Broker connection failed")
 
         health = launcher.check_run_worker_health(run)
-        assert health.status == WorkerStatus.UNKNOWN
+        assert health.status == WorkerStatus.RUNNING
         assert "broker connection failed" in health.msg.lower()
         assert mock_sleep.call_count == HEALTH_CHECK_MAX_RETRIES - 1
 
@@ -424,6 +430,108 @@ class TestCheckRunWorkerHealth:
         health = launcher.check_run_worker_health(run)
         assert health.status == WorkerStatus.RUNNING
         assert mock_sleep.call_count == 1
+
+
+class TestWorkerHealthConfirmation:
+    """Soft health outcomes (empty ping reply, PENDING, broker errors) must be
+    confirmed over consecutive monitoring cycles before FAILED is reported.
+
+    Stock dagster core treats any non-RUNNING/SUCCESS status as unhealthy and acts
+    immediately, so the confirmation MUST live in the launcher: unconfirmed cycles
+    report RUNNING, and only the strike threshold escalates to FAILED.
+    """
+
+    def _no_ping_reply(self, mock_celery_app):
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "STARTED"
+        result.info = {"hostname": "celery@worker-pod-1"}
+        inspect_mock = MagicMock()
+        inspect_mock.ping.return_value = None
+        mock_celery_app.control.inspect.return_value = inspect_mock
+
+    def _healthy_ping(self, mock_celery_app):
+        inspect_mock = MagicMock()
+        inspect_mock.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
+        mock_celery_app.control.inspect.return_value = inspect_mock
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_strikes_escalate_to_failed_at_threshold(self, _sleep, launcher, mock_celery_app):
+        run = _make_run()
+        self._no_ping_reply(mock_celery_app)
+
+        # fixture sets worker_health_confirmation_cycles = 3
+        for strike in (1, 2):
+            health = launcher.check_run_worker_health(run)
+            assert health.status == WorkerStatus.RUNNING
+            assert f"{strike}/3" in health.msg
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.FAILED
+        assert "3 consecutive" in health.msg
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_strikes_reset_after_failed_is_reported(self, _sleep, launcher, mock_celery_app):
+        """Once FAILED is reported the streak restarts — a later re-check (e.g. before
+        the daemon acts) must not re-fail instantly off stale strikes.
+        """
+        run = _make_run()
+        self._no_ping_reply(mock_celery_app)
+
+        for _ in range(3):
+            health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.FAILED
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_healthy_ping_resets_strikes(self, _sleep, launcher, mock_celery_app):
+        run = _make_run()
+
+        self._no_ping_reply(mock_celery_app)
+        launcher.check_run_worker_health(run)
+        launcher.check_run_worker_health(run)
+
+        self._healthy_ping(mock_celery_app)
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+        assert not health.msg
+
+        # Streak restarted: two more soft cycles stay below the threshold of 3
+        self._no_ping_reply(mock_celery_app)
+        launcher.check_run_worker_health(run)
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.RUNNING
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_strikes_are_tracked_per_run(self, _sleep, launcher, mock_celery_app):
+        self._no_ping_reply(mock_celery_app)
+
+        run_a = _make_run()
+        run_a.run_id = "run-a"
+        run_b = _make_run()
+        run_b.run_id = "run-b"
+
+        launcher.check_run_worker_health(run_a)
+        launcher.check_run_worker_health(run_a)
+        launcher.check_run_worker_health(run_b)
+
+        # run_a is at 2 strikes, run_b at 1 — neither has reached 3
+        assert launcher.check_run_worker_health(run_b).status == WorkerStatus.RUNNING
+        assert launcher.check_run_worker_health(run_a).status == WorkerStatus.FAILED
+
+    def test_hard_task_failure_needs_no_confirmation(self, launcher, mock_celery_app):
+        """Task state FAILURE in the result backend is hard evidence — immediate FAILED."""
+        run = _make_run()
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "FAILURE"
+
+        health = launcher.check_run_worker_health(run)
+        assert health.status == WorkerStatus.FAILED
+
+    def test_confirmation_cycles_config_default(self):
+        field = CeleryRunLauncher.config_type()["worker_health_confirmation_cycles"]
+        assert field.default_value == 5
 
 
 class TestExecuteJobTaskDuplicateDelivery:
@@ -528,8 +636,8 @@ class TestIncidentReplayBrokerBrownout:
 
     @patch("dagster_celery.launcher.time.sleep")
     def test_short_brownout_does_not_fail_live_run(self, _mock_sleep):
-        """A brownout spanning fewer monitoring cycles than the UNKNOWN threshold must
-        leave the run untouched, so the live worker finishes it normally.
+        """A brownout spanning fewer monitoring cycles than the confirmation threshold
+        must leave the run untouched, so the live worker finishes it normally.
         """
         mock_app = MagicMock()
         brownout = MagicMock()
@@ -576,8 +684,8 @@ class TestIncidentReplayBrokerBrownout:
 
     @patch("dagster_celery.launcher.time.sleep")
     def test_sustained_outage_fails_run_and_revokes_task(self, _mock_sleep):
-        """When the outage persists past the UNKNOWN threshold and resume attempts are
-        exhausted, the run is failed AND its celery task is revoked — a still-alive
+        """When the outage persists past the confirmation threshold and resume attempts
+        are exhausted, the run is failed AND its celery task is revoked — a still-alive
         worker can no longer keep executing and overwrite FAILURE with SUCCESS.
         """
         mock_app = MagicMock()
@@ -590,6 +698,7 @@ class TestIncidentReplayBrokerBrownout:
                     "run_launcher": {
                         "module": "dagster_celery.launcher",
                         "class": "CeleryRunLauncher",
+                        "config": {"worker_health_confirmation_cycles": 3},
                     },
                     "run_monitoring": {"enabled": True, "max_resume_run_attempts": 0},
                 },

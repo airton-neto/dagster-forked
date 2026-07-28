@@ -35,6 +35,18 @@ HEALTH_CHECK_RETRY_DELAY_SECONDS = 5.0
 # (the run terminal event is normally written before the task returns).
 TASK_SUCCESS_TERMINAL_GRACE_SECONDS = 60.0
 
+# Soft (unconfirmed) health outcomes — empty ping reply, PENDING, broker errors —
+# must repeat for this many consecutive monitoring cycles before FAILED is
+# reported. Stock dagster core acts immediately on any non-RUNNING/SUCCESS
+# status, so this confirmation MUST live in the launcher: unconfirmed cycles
+# report RUNNING (treat-as-alive) instead of UNKNOWN.
+DEFAULT_WORKER_HEALTH_CONFIRMATION_CYCLES = 5
+
+# Backstop against unbounded strike-dict growth (entries for runs that finished
+# mid-streak are never individually cleaned; the daemon process restart also
+# clears them).
+_MAX_TRACKED_HEALTH_STRIKES = 1000
+
 from dagster_celery.config import DEFAULT_CONFIG, TASK_EXECUTE_JOB_NAME, TASK_RESUME_JOB_NAME
 from dagster_celery.defaults import task_default_queue
 from dagster_celery.make_app import make_app
@@ -77,6 +89,7 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         include: list[str] | None = None,
         config_source: dict | None = None,
         inst_data: ConfigurableClassData | None = None,
+        worker_health_confirmation_cycles: int | None = None,
     ) -> None:
         self._inst_data = check.opt_inst_param(inst_data, "inst_data", ConfigurableClassData)
 
@@ -87,6 +100,14 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             DEFAULT_CONFIG, **check.opt_dict_param(config_source, "config_source")
         )
         self.default_queue = check.str_param(default_queue, "default_queue")
+        self.worker_health_confirmation_cycles = check.opt_int_param(
+            worker_health_confirmation_cycles,
+            "worker_health_confirmation_cycles",
+            default=DEFAULT_WORKER_HEALTH_CONFIRMATION_CYCLES,
+        )
+        # Consecutive soft-failure strikes per run_id, held in the (long-lived)
+        # monitoring daemon process.
+        self._worker_health_strikes: dict[str, int] = {}
 
         self.celery = make_app(
             app_args=self.app_args(),
@@ -240,10 +261,52 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
     def check_run_worker_health(self, run: DagsterRun) -> CheckRunHealthResult:
         """Check whether the Celery worker running this task is alive.
 
+        Hard evidence (task state FAILURE, task SUCCESS without a run terminal
+        event) is reported as FAILED immediately. Soft outcomes — empty ping
+        reply, PENDING, broker errors — are indistinguishable from a transient
+        broker/network disruption, so they report RUNNING (treat-as-alive) until
+        `worker_health_confirmation_cycles` consecutive monitoring cycles agree,
+        and only then FAILED. Stock dagster core acts on any non-RUNNING/SUCCESS
+        status immediately, which is why the confirmation lives here rather than
+        in the monitoring daemon.
+        """
+        raw = self._check_run_worker_health_raw(run)
+        return self._confirm_worker_health(run.run_id, raw)
+
+    def _confirm_worker_health(
+        self, run_id: str, raw: CheckRunHealthResult
+    ) -> CheckRunHealthResult:
+        if len(self._worker_health_strikes) > _MAX_TRACKED_HEALTH_STRIKES:
+            self._worker_health_strikes.clear()
+
+        if raw.status in (WorkerStatus.RUNNING, WorkerStatus.SUCCESS, WorkerStatus.FAILED):
+            # RUNNING/SUCCESS: healthy — reset the streak. FAILED: hard evidence
+            # from the result backend — no confirmation needed.
+            self._worker_health_strikes.pop(run_id, None)
+            return raw
+
+        strikes = self._worker_health_strikes.get(run_id, 0) + 1
+        if strikes >= self.worker_health_confirmation_cycles:
+            self._worker_health_strikes.pop(run_id, None)
+            return CheckRunHealthResult(
+                WorkerStatus.FAILED,
+                f"Worker health unconfirmed for {strikes} consecutive checks: {raw.msg}",
+            )
+
+        self._worker_health_strikes[run_id] = strikes
+        return CheckRunHealthResult(
+            WorkerStatus.RUNNING,
+            f"Worker health unconfirmed"
+            f" (check {strikes}/{self.worker_health_confirmation_cycles}), treating as"
+            f" alive: {raw.msg}",
+        )
+
+    def _check_run_worker_health_raw(self, run: DagsterRun) -> CheckRunHealthResult:
+        """Single-cycle health probe.
+
         Retries transient failures (PENDING/broker errors) up to
-        HEALTH_CHECK_MAX_RETRIES times before reporting UNKNOWN to the
-        monitoring daemon, which would otherwise immediately mark the run
-        as failed.
+        HEALTH_CHECK_MAX_RETRIES times before reporting UNKNOWN, which
+        `_confirm_worker_health` then absorbs into the strike counter.
         """
         logger = logging.getLogger(__name__)
         task_id = run.tags[DAGSTER_CELERY_TASK_ID_TAG]
@@ -470,6 +533,17 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                 Noneable(Permissive()),
                 is_required=False,
                 description="Additional settings for the Celery app.",
+            ),
+            "worker_health_confirmation_cycles": Field(
+                int,
+                is_required=False,
+                default_value=DEFAULT_WORKER_HEALTH_CONFIRMATION_CYCLES,
+                description=(
+                    "Consecutive monitoring cycles a soft worker-health failure (empty"
+                    " ping reply, PENDING task state, broker errors) must persist before"
+                    " the run worker is reported FAILED. Unconfirmed cycles report the"
+                    " worker as alive, absorbing transient broker/network disruptions."
+                ),
             ),
         }
 
