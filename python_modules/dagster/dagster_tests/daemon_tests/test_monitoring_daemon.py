@@ -393,19 +393,27 @@ def test_monitor_started_unknown_status_waits_for_threshold(
     assert instance.run_monitoring_unknown_status_threshold == 3
 
     with environ({"DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT": "unknown"}):
-        for expected_resumes in (0, 0, 1):
+        for _ in range(2):
             monitor_started_run(instance, workspace, run_record, logger)
             run = instance.get_run_by_id(run_id)
             assert run
             assert run.status == DagsterRunStatus.STARTED
-            assert run_launcher.resume_run_calls == expected_resumes
+            assert run_launcher.resume_run_calls == 0
 
-    # A healthy check resets the consecutive-UNKNOWN streak
+    # A healthy check resets the consecutive-UNKNOWN streak: two more UNKNOWN
+    # cycles afterwards must NOT reach the threshold (2 + 2 without the reset would)
     with environ({"DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT": "healthy"}):
         monitor_started_run(instance, workspace, run_record, logger)
     with environ({"DAGSTER_TEST_RUN_HEALTH_CHECK_RESULT": "unknown"}):
         for _ in range(2):
             monitor_started_run(instance, workspace, run_record, logger)
+            run = instance.get_run_by_id(run_id)
+            assert run
+            assert run.status == DagsterRunStatus.STARTED
+            assert run_launcher.resume_run_calls == 0
+
+        # The third consecutive UNKNOWN after the reset reaches the threshold
+        monitor_started_run(instance, workspace, run_record, logger)
         run = instance.get_run_by_id(run_id)
         assert run
         assert run.status == DagsterRunStatus.STARTED

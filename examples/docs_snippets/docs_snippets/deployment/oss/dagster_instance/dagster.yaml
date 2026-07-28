@@ -349,6 +349,9 @@ run_monitoring:
   cancel_timeout_seconds: 180
   max_resume_run_attempts: 3
   poll_interval_seconds: 120
+  # consecutive UNKNOWN worker-health checks tolerated before the run is
+  # resumed or failed (absorbs transient broker/network disruptions)
+  unknown_status_threshold: 3
   # free concurrency slots held by finished runs after this many seconds.
   # required when using dagster/concurrency_key op tags to prevent
   # cancelled runs from permanently blocking the concurrency pool.

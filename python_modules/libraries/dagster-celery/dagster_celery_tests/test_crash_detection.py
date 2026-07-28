@@ -118,6 +118,29 @@ class TestResumeRunRevokesPriorTask:
 
         mock_celery_app.AsyncResult.return_value.revoke.assert_not_called()
 
+    def test_resume_run_revokes_before_launching(self, launcher, mock_celery_app):
+        """The ordering IS the safety property: revoking after launch would leave a
+        window with two workers executing the same run.
+        """
+        run = _make_run(task_id="prior-task-id")
+        context = ResumeRunContext(dagster_run=run, workspace=None, resume_attempt_number=1)
+        order_tracker = MagicMock()
+
+        with (
+            patch("dagster_celery.launcher.create_resume_job_task") as mock_create,
+            patch("dagster_celery.launcher.ResumeRunArgs"),
+            patch("dagster_celery.launcher.pack_value"),
+            patch.object(CeleryRunLauncher, "_launch_celery_task_run") as mock_launch,
+        ):
+            mock_create.return_value = MagicMock()
+            order_tracker.attach_mock(mock_celery_app.AsyncResult.return_value.revoke, "revoke")
+            order_tracker.attach_mock(mock_launch, "launch")
+
+            launcher.resume_run(context)
+
+        call_names = [name for name, _args, _kwargs in order_tracker.mock_calls]
+        assert call_names.index("revoke") < call_names.index("launch")
+
     def test_resume_run_revoke_failure_does_not_block_resume(self, launcher, mock_celery_app):
         """A broker error while revoking must not prevent the resume from launching."""
         run = _make_run(task_id="prior-task-id")
@@ -593,3 +616,24 @@ class TestIncidentReplayBrokerBrownout:
             assert current is not None
             assert current.status == DagsterRunStatus.FAILURE
             mock_app.AsyncResult.return_value.revoke.assert_called_once_with(terminate=True)
+
+
+class TestTerminate:
+    def test_terminate_revokes_task(self, launcher, mock_celery_app):
+        run = _make_run(task_id="task-9")
+        launcher._instance.get_run_by_id.return_value = run  # noqa: SLF001
+
+        assert launcher.terminate("test-run-id") is True
+        mock_celery_app.AsyncResult.assert_called_once_with("task-9")
+        mock_celery_app.AsyncResult.return_value.revoke.assert_called_once_with(terminate=True)
+
+    def test_terminate_without_task_id_tag_returns_false(self, launcher, mock_celery_app):
+        """A run that never got a celery task id (launch failed early) must return a
+        clean False, not raise KeyError.
+        """
+        run = _make_run()
+        run.tags = {}
+        launcher._instance.get_run_by_id.return_value = run  # noqa: SLF001
+
+        assert launcher.terminate("test-run-id") is False
+        mock_celery_app.AsyncResult.return_value.revoke.assert_not_called()

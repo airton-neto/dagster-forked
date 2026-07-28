@@ -138,7 +138,13 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         if run is None:
             return False
 
-        task_id = run.tags[DAGSTER_CELERY_TASK_ID_TAG]
+        # Deliberately NO `run.is_finished` guard (unlike other launchers): run
+        # monitoring calls this AFTER marking the run failed, precisely to revoke
+        # the celery task of a worker that may still be alive and executing.
+        # Adding the guard would silently disable the zombie-worker protection.
+        task_id = run.tags.get(DAGSTER_CELERY_TASK_ID_TAG)
+        if task_id is None:
+            return False
 
         result: AsyncResult = self.celery.AsyncResult(task_id)
         result.revoke(terminate=True)

@@ -104,3 +104,9 @@ This feature is currently only supported when using:
 The monitoring daemon handles these by performing health checks on the run workers. If a failure is detected, the daemon can launch a new run worker which resumes execution of the existing run. The run worker crash will be show in the event log, and the run will continue to completion. If the run worker continues to crash, the daemon will mark the run as failed after the configured number of attempts.
 
 To enable, set `max_resume_run_attempts` to a value greater than 0.
+
+When a health check cannot determine the worker's status (for example, a Celery
+worker's ping reply is lost to a transient broker or network disruption), the check
+reports UNKNOWN instead of a failure. The daemon only treats the worker as unhealthy
+after `unknown_status_threshold` consecutive UNKNOWN checks (default: 3), so short
+disruptions don't fail runs whose workers are still alive.
