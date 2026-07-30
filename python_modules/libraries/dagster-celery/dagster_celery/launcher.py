@@ -309,7 +309,28 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         `_confirm_worker_health` then absorbs into the strike counter.
         """
         logger = logging.getLogger(__name__)
-        task_id = run.tags[DAGSTER_CELERY_TASK_ID_TAG]
+        task_id = run.tags.get(DAGSTER_CELERY_TASK_ID_TAG)
+        if task_id is None:
+            # launch_run died between apply_async and add_run_tags: the task may be
+            # executing, but the result backend cannot be queried without its id.
+            # Ping the worker hostname if the run worker tagged it; otherwise report
+            # UNKNOWN and let the strike counter decide (FAILED after N cycles frees
+            # monitoring to resume the run on a healthy worker, which re-tags it).
+            tagged_hostname = run.tags.get(DAGSTER_CELERY_WORKER_HOSTNAME_TAG)
+            if tagged_hostname:
+                ping_result = self._ping_hostname(tagged_hostname)
+                if ping_result.status == WorkerStatus.RUNNING:
+                    return ping_result
+                return CheckRunHealthResult(
+                    WorkerStatus.UNKNOWN,
+                    f"Run has no {DAGSTER_CELERY_TASK_ID_TAG} tag; {ping_result.msg}",
+                )
+            return CheckRunHealthResult(
+                WorkerStatus.UNKNOWN,
+                f"Run has no {DAGSTER_CELERY_TASK_ID_TAG} tag and no"
+                f" {DAGSTER_CELERY_WORKER_HOSTNAME_TAG} tag to ping — the celery task id"
+                " was never recorded (launch likely failed after task submission).",
+            )
 
         last_result: CheckRunHealthResult | None = None
         for attempt in range(1, HEALTH_CHECK_MAX_RETRIES + 1):
@@ -474,11 +495,14 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
     def get_run_worker_debug_info(
         self, run: DagsterRun, include_container_logs: bool | None = True
     ) -> str | None:
-        task_id = run.tags[DAGSTER_CELERY_TASK_ID_TAG]
+        task_id = run.tags.get(DAGSTER_CELERY_TASK_ID_TAG)
 
-        result: AsyncResult = self.celery.AsyncResult(task_id)
-        task_status = result.state
-        worker = result.worker
+        task_status = None
+        worker = None
+        if task_id is not None:
+            result: AsyncResult = self.celery.AsyncResult(task_id)
+            task_status = result.state
+            worker = result.worker
 
         return str(
             {

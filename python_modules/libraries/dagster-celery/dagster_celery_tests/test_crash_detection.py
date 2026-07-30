@@ -727,6 +727,88 @@ class TestIncidentReplayBrokerBrownout:
             mock_app.AsyncResult.return_value.revoke.assert_called_once_with(terminate=True)
 
 
+class TestMissingTaskIdTag:
+    """A run can reach STARTED/STARTING without the celery task id tag when
+    ``launch_run`` dies between ``apply_async`` and ``add_run_tags`` (the task was
+    submitted, the tag write failed). Health checks must degrade to the hostname
+    ping or the soft-confirmation path instead of raising KeyError, which would
+    make the run permanently unmonitorable.
+    """
+
+    def test_health_check_missing_task_id_no_hostname_returns_running_unconfirmed(
+        self, launcher, mock_celery_app
+    ):
+        run = _make_run()
+        run.tags = {}
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed (check 1/3)" in health.msg
+        assert DAGSTER_CELERY_TASK_ID_TAG in health.msg
+        mock_celery_app.AsyncResult.assert_not_called()
+
+    def test_health_check_missing_task_id_escalates_to_failed_at_threshold(
+        self, launcher, mock_celery_app
+    ):
+        run = _make_run()
+        run.tags = {}
+
+        first = launcher.check_run_worker_health(run)
+        second = launcher.check_run_worker_health(run)
+        third = launcher.check_run_worker_health(run)
+
+        assert first.status == WorkerStatus.RUNNING
+        assert second.status == WorkerStatus.RUNNING
+        assert third.status == WorkerStatus.FAILED
+        assert "unconfirmed for 3 consecutive checks" in third.msg
+
+    def test_health_check_missing_task_id_with_hostname_tag_pings_worker(
+        self, launcher, mock_celery_app
+    ):
+        run = _make_run()
+        run.tags = {DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@worker-pod-1"}
+
+        inspect_mock = MagicMock()
+        inspect_mock.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
+        mock_celery_app.control.inspect.return_value = inspect_mock
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert health.msg is None
+        mock_celery_app.control.inspect.assert_called_with(
+            destination=["celery@worker-pod-1"], timeout=2.0
+        )
+        mock_celery_app.AsyncResult.assert_not_called()
+
+    def test_health_check_missing_task_id_with_dead_hostname_counts_strike(
+        self, launcher, mock_celery_app
+    ):
+        run = _make_run()
+        run.tags = {DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@worker-pod-1"}
+
+        inspect_mock = MagicMock()
+        inspect_mock.ping.return_value = {}
+        mock_celery_app.control.inspect.return_value = inspect_mock
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed (check 1/3)" in health.msg
+
+    def test_debug_info_missing_task_id_tag_does_not_raise(self, launcher, mock_celery_app):
+        run = _make_run()
+        run.tags = {}
+
+        debug_info = launcher.get_run_worker_debug_info(run)
+
+        assert "'celery_task_id': None" in debug_info
+        assert "'task_status': None" in debug_info
+        assert "test-run-id" in debug_info
+        mock_celery_app.AsyncResult.assert_not_called()
+
+
 class TestTerminate:
     def test_terminate_revokes_task(self, launcher, mock_celery_app):
         run = _make_run(task_id="task-9")
