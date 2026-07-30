@@ -304,33 +304,33 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
     def _check_run_worker_health_raw(self, run: DagsterRun) -> CheckRunHealthResult:
         """Single-cycle health probe.
 
-        Retries transient failures (PENDING/broker errors) up to
-        HEALTH_CHECK_MAX_RETRIES times before reporting UNKNOWN, which
-        `_confirm_worker_health` then absorbs into the strike counter.
+        A run missing the celery task id tag short-circuits into task-id recovery
+        from the worker inventory (see ``_recover_task_id``) before the retry loop;
+        unrecoverable runs report UNKNOWN. Transient failures (PENDING/broker
+        errors) retry up to HEALTH_CHECK_MAX_RETRIES times before reporting
+        UNKNOWN, which `_confirm_worker_health` then absorbs into the strike
+        counter.
         """
         logger = logging.getLogger(__name__)
         task_id = run.tags.get(DAGSTER_CELERY_TASK_ID_TAG)
-        if task_id is None:
-            # launch_run died between apply_async and add_run_tags: the task may be
-            # executing, but the result backend cannot be queried without its id.
-            # Ping the worker hostname if the run worker tagged it; otherwise report
-            # UNKNOWN and let the strike counter decide (FAILED after N cycles frees
-            # monitoring to resume the run on a healthy worker, which re-tags it).
-            tagged_hostname = run.tags.get(DAGSTER_CELERY_WORKER_HOSTNAME_TAG)
-            if tagged_hostname:
-                ping_result = self._ping_hostname(tagged_hostname)
-                if ping_result.status == WorkerStatus.RUNNING:
-                    return ping_result
+        if not task_id:
+            # launch_run died between apply_async and add_run_tags (or the tag is
+            # empty): the task may be executing, but the result backend cannot be
+            # queried without its id. Recover the id from the workers' active and
+            # reserved task inventories and re-tag the run — restoring both
+            # monitorability and revocability. When the run is in no inventory the
+            # task is not executing anywhere reachable: report UNKNOWN and let the
+            # strike counter decide (FAILED after N cycles frees monitoring to
+            # resume the run; a stale broker-queued duplicate of the original task
+            # is rejected by the delivery guard in tasks.py).
+            task_id = self._recover_task_id(run)
+            if not task_id:
                 return CheckRunHealthResult(
                     WorkerStatus.UNKNOWN,
-                    f"Run has no {DAGSTER_CELERY_TASK_ID_TAG} tag; {ping_result.msg}",
+                    f"Run has no {DAGSTER_CELERY_TASK_ID_TAG} tag and was not found in"
+                    " any worker's active/reserved task inventory — the celery task id"
+                    " was never recorded (launch likely failed after task submission).",
                 )
-            return CheckRunHealthResult(
-                WorkerStatus.UNKNOWN,
-                f"Run has no {DAGSTER_CELERY_TASK_ID_TAG} tag and no"
-                f" {DAGSTER_CELERY_WORKER_HOSTNAME_TAG} tag to ping — the celery task id"
-                " was never recorded (launch likely failed after task submission).",
-            )
 
         last_result: CheckRunHealthResult | None = None
         for attempt in range(1, HEALTH_CHECK_MAX_RETRIES + 1):
@@ -385,6 +385,56 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             last_result.msg if last_result else "",
         )
         return last_result  # type: ignore[return-value]
+
+    def _recover_task_id(self, run: DagsterRun) -> "str | None":
+        """Find the celery task executing this run when the task id tag is missing.
+
+        Broadcasts an active/reserved inventory request to all workers and matches
+        the run id inside the task arguments. On a match the run is re-tagged so
+        subsequent health checks, ``terminate`` and ``resume_run`` can address the
+        task again; the recovered id is still used for the current check when the
+        tag write fails.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            inspector = self.celery.control.inspect(timeout=2.0)
+            inventories = (inspector.active() or {}, inspector.reserved() or {})
+        except Exception as e:
+            logger.warning(
+                "Failed to inspect the worker task inventory while recovering the"
+                " celery task id for run %s: %s",
+                run.run_id,
+                e,
+            )
+            return None
+
+        for inventory in inventories:
+            for tasks in inventory.values():
+                for task in tasks or ():
+                    if run.run_id not in f"{task.get('args')}{task.get('kwargs')}":
+                        continue
+                    task_id = task.get("id")
+                    if not task_id:
+                        continue
+                    try:
+                        self._instance.add_run_tags(
+                            run.run_id, {DAGSTER_CELERY_TASK_ID_TAG: task_id}
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Recovered celery task id %s for run %s but re-tagging"
+                            " failed; using it for this check only.",
+                            task_id,
+                            run.run_id,
+                            exc_info=True,
+                        )
+                    logger.info(
+                        "Recovered celery task id %s for run %s from the worker task inventory.",
+                        task_id,
+                        run.run_id,
+                    )
+                    return task_id
+        return None
 
     def _check_task_success_run_terminal(
         self, run: DagsterRun, result: "AsyncResult"
@@ -499,7 +549,7 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
 
         task_status = None
         worker = None
-        if task_id is not None:
+        if task_id:
             result: AsyncResult = self.celery.AsyncResult(task_id)
             task_status = result.state
             worker = result.worker

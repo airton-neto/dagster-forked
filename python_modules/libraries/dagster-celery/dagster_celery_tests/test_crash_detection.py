@@ -727,75 +727,156 @@ class TestIncidentReplayBrokerBrownout:
             mock_app.AsyncResult.return_value.revoke.assert_called_once_with(terminate=True)
 
 
+def _inventory_task(run_id="test-run-id", task_id="recovered-task-id"):
+    """Shape of one entry in celery's inspect().active()/reserved() inventory."""
+    return {
+        "id": task_id,
+        "name": "execute_job",
+        "args": "()",
+        "kwargs": f"{{'execute_job_args_packed': {{'run_id': '{run_id}', ...}}}}",
+    }
+
+
 class TestMissingTaskIdTag:
     """A run can reach STARTED/STARTING without the celery task id tag when
     ``launch_run`` dies between ``apply_async`` and ``add_run_tags`` (the task was
-    submitted, the tag write failed). Health checks must degrade to the hostname
-    ping or the soft-confirmation path instead of raising KeyError, which would
-    make the run permanently unmonitorable.
+    submitted, the tag write failed). Health checks must recover the task id from
+    the workers' active/reserved inventory — restoring monitorability AND
+    revocability — or degrade to the soft-confirmation path instead of raising
+    KeyError, which would make the run permanently unmonitorable.
     """
 
-    def test_health_check_missing_task_id_no_hostname_returns_running_unconfirmed(
+    def _set_inventory(self, mock_celery_app, active=None, reserved=None):
+        inspect_mock = MagicMock()
+        inspect_mock.active.return_value = active or {}
+        inspect_mock.reserved.return_value = reserved or {}
+        mock_celery_app.control.inspect.return_value = inspect_mock
+        return inspect_mock
+
+    def test_missing_task_id_recovered_from_active_inventory_and_retagged(
         self, launcher, mock_celery_app
     ):
         run = _make_run()
         run.tags = {}
+        self._set_inventory(mock_celery_app, active={"celery@worker-pod-1": [_inventory_task()]})
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "FAILURE"
+
+        health = launcher.check_run_worker_health(run)
+
+        # The recovered id feeds the NORMAL evidence chain: hard task FAILURE
+        # is reported immediately, proving the loop ran with the recovered id.
+        assert health.status == WorkerStatus.FAILED
+        assert health.msg == "Celery task failed."
+        mock_celery_app.AsyncResult.assert_called_once_with("recovered-task-id")
+        launcher._instance.add_run_tags.assert_called_once_with(  # noqa: SLF001
+            "test-run-id", {DAGSTER_CELERY_TASK_ID_TAG: "recovered-task-id"}
+        )
+
+    def test_missing_task_id_recovered_from_reserved_inventory(self, launcher, mock_celery_app):
+        run = _make_run()
+        run.tags = {}
+        self._set_inventory(mock_celery_app, reserved={"celery@worker-pod-1": [_inventory_task()]})
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "FAILURE"
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.FAILED
+        mock_celery_app.AsyncResult.assert_called_once_with("recovered-task-id")
+
+    def test_missing_task_id_retag_failure_still_uses_recovered_id(self, launcher, mock_celery_app):
+        run = _make_run()
+        run.tags = {}
+        self._set_inventory(mock_celery_app, active={"celery@worker-pod-1": [_inventory_task()]})
+        launcher._instance.add_run_tags.side_effect = Exception("db down")  # noqa: SLF001
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "FAILURE"
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.FAILED
+        mock_celery_app.AsyncResult.assert_called_once_with("recovered-task-id")
+
+    def test_missing_task_id_other_runs_in_inventory_do_not_match(self, launcher, mock_celery_app):
+        run = _make_run()
+        run.tags = {}
+        self._set_inventory(
+            mock_celery_app,
+            active={
+                "celery@worker-pod-1": [
+                    _inventory_task(run_id="some-other-run", task_id="other-task")
+                ]
+            },
+        )
 
         health = launcher.check_run_worker_health(run)
 
         assert health.status == WorkerStatus.RUNNING
         assert "unconfirmed (check 1/3)" in health.msg
         assert DAGSTER_CELERY_TASK_ID_TAG in health.msg
+        assert "inventory" in health.msg
         mock_celery_app.AsyncResult.assert_not_called()
 
-    def test_health_check_missing_task_id_escalates_to_failed_at_threshold(
+    def test_missing_task_id_not_in_inventory_escalates_to_failed_at_threshold(
         self, launcher, mock_celery_app
     ):
         run = _make_run()
         run.tags = {}
+        self._set_inventory(mock_celery_app)
 
         first = launcher.check_run_worker_health(run)
         second = launcher.check_run_worker_health(run)
         third = launcher.check_run_worker_health(run)
 
         assert first.status == WorkerStatus.RUNNING
+        assert "unconfirmed (check 1/3)" in first.msg
         assert second.status == WorkerStatus.RUNNING
         assert third.status == WorkerStatus.FAILED
         assert "unconfirmed for 3 consecutive checks" in third.msg
-
-    def test_health_check_missing_task_id_with_hostname_tag_pings_worker(
-        self, launcher, mock_celery_app
-    ):
-        run = _make_run()
-        run.tags = {DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@worker-pod-1"}
-
-        inspect_mock = MagicMock()
-        inspect_mock.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
-        mock_celery_app.control.inspect.return_value = inspect_mock
-
-        health = launcher.check_run_worker_health(run)
-
-        assert health.status == WorkerStatus.RUNNING
-        assert health.msg is None
-        mock_celery_app.control.inspect.assert_called_with(
-            destination=["celery@worker-pod-1"], timeout=2.0
-        )
         mock_celery_app.AsyncResult.assert_not_called()
 
-    def test_health_check_missing_task_id_with_dead_hostname_counts_strike(
+    def test_missing_task_id_inventory_inspect_raises_counts_strike(
         self, launcher, mock_celery_app
     ):
         run = _make_run()
-        run.tags = {DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@worker-pod-1"}
-
+        run.tags = {}
         inspect_mock = MagicMock()
-        inspect_mock.ping.return_value = {}
+        inspect_mock.active.side_effect = OSError("broker down")
         mock_celery_app.control.inspect.return_value = inspect_mock
 
         health = launcher.check_run_worker_health(run)
 
         assert health.status == WorkerStatus.RUNNING
         assert "unconfirmed (check 1/3)" in health.msg
+        mock_celery_app.AsyncResult.assert_not_called()
+
+    def test_empty_string_task_id_tag_takes_recovery_path(self, launcher, mock_celery_app):
+        """An empty-string tag must not reach AsyncResult("") — it burns the retry
+        loop on a bogus PENDING result instead of recovering the real task id.
+        """
+        run = _make_run(task_id="")
+        self._set_inventory(mock_celery_app)
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed (check 1/3)" in health.msg
+        mock_celery_app.AsyncResult.assert_not_called()
+
+
+class TestGetRunWorkerDebugInfo:
+    def test_debug_info_with_task_id_reports_task_state(self, launcher, mock_celery_app):
+        run = _make_run()
+        result = mock_celery_app.AsyncResult.return_value
+        result.state = "STARTED"
+        result.worker = "celery@worker-pod-1"
+
+        debug_info = launcher.get_run_worker_debug_info(run)
+
+        assert "'celery_task_id': 'test-task-123'" in debug_info
+        assert "'task_status': 'STARTED'" in debug_info
+        assert "'worker': 'celery@worker-pod-1'" in debug_info
 
     def test_debug_info_missing_task_id_tag_does_not_raise(self, launcher, mock_celery_app):
         run = _make_run()
