@@ -303,6 +303,10 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         and only then FAILED. Stock dagster core acts on any non-RUNNING/SUCCESS
         status immediately, which is why the confirmation lives here rather than
         in the monitoring daemon.
+
+        An empty ping reply corroborated by a fresh worker heartbeat event is
+        reported as healthy RUNNING directly (resets strikes) — see
+        ``_ping_hostname``; only uncorroborated soft failures accumulate strikes.
         """
         raw = self._check_run_worker_health_raw(run)
         return self._confirm_worker_health(run.run_id, raw)
