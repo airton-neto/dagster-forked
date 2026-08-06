@@ -1,4 +1,5 @@
 import weakref
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -41,7 +42,11 @@ def launcher(mock_celery_app):
         obj._mock_instance_ref = mock_instance  # noqa: SLF001  # keep strong ref alive
         obj.default_queue = "dagster"
         obj.worker_health_confirmation_cycles = 3
+        obj.ping_timeout = 2.0
         obj._worker_health_strikes = {}  # noqa: SLF001
+        # Control-plane calls go through a short-lived app; unit tests route them
+        # back to the shared mock app.
+        obj._control_app = lambda: nullcontext(mock_celery_app)  # noqa: SLF001
         return obj
 
 
@@ -632,6 +637,9 @@ class TestIncidentReplayBrokerBrownout:
         result.state = "STARTED"
         result.info = {"hostname": hostname}
         instance.run_launcher.celery = mock_app
+        # Control-plane calls (pings, heartbeat listens) go through a short-lived
+        # app; route them to the same mock so only celery itself is mocked.
+        instance.run_launcher._control_app = lambda: nullcontext(mock_app)  # noqa: SLF001
         return run, instance.get_run_record_by_id(run.run_id)
 
     @patch("dagster_celery.launcher.time.sleep")
@@ -909,3 +917,183 @@ class TestTerminate:
 
         assert launcher.terminate("test-run-id") is False
         mock_celery_app.AsyncResult.return_value.revoke.assert_not_called()
+
+
+class FakeHeartbeatReceiver:
+    """Stands in for celery.events.Receiver: replays canned events into the handler."""
+
+    def __init__(self, handlers, events):
+        self.handlers = handlers
+        self.events = events
+        self.should_stop = False
+
+    def capture(self, limit=None, timeout=None, wakeup=True):
+        handler = self.handlers["*"]
+        for event in self.events:
+            if self.should_stop:
+                return
+            handler(event)
+        if not self.should_stop:
+            raise TimeoutError()
+
+
+def _install_heartbeat_events(mock_celery_app, events):
+    mock_celery_app.events.Receiver = lambda connection, handlers: FakeHeartbeatReceiver(
+        handlers, events
+    )
+
+
+class TestHeartbeatCorroboration:
+    """An empty ping reply alone must not accumulate strikes when the worker is
+    demonstrably alive: workers publish heartbeat/task events every few seconds,
+    so a fresh event from the tagged hostname is positive evidence of life even
+    when the pidbox reply path is broken (alupar 2026-08-04..06 incident: the
+    daemon's pings to worker-intraday-0 timed out 15/15 per run for days while
+    heartbeats never stopped, killing every intraday run at the 5-strike mark).
+    """
+
+    def _started_run_with_empty_ping(self, mock_celery_app, hostname="celery@worker-pod-1"):
+        mock_celery_app.AsyncResult.return_value.state = "STARTED"
+        mock_celery_app.control.inspect.return_value.ping.return_value = {}
+        run = _make_run()
+        run.tags = {
+            DAGSTER_CELERY_TASK_ID_TAG: "test-task-123",
+            DAGSTER_CELERY_WORKER_HOSTNAME_TAG: hostname,
+        }
+        return run
+
+    def test_empty_ping_with_fresh_heartbeat_returns_running(self, launcher, mock_celery_app):
+        run = self._started_run_with_empty_ping(mock_celery_app)
+        _install_heartbeat_events(
+            mock_celery_app,
+            [{"hostname": "celery@worker-pod-1", "type": "worker-heartbeat"}],
+        )
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "heartbeat" in (health.msg or "").lower()
+        assert launcher._worker_health_strikes == {}  # noqa: SLF001
+
+    def test_empty_ping_with_fresh_heartbeat_does_not_retry_ping(self, launcher, mock_celery_app):
+        run = self._started_run_with_empty_ping(mock_celery_app)
+        _install_heartbeat_events(
+            mock_celery_app,
+            [{"hostname": "celery@worker-pod-1", "type": "worker-heartbeat"}],
+        )
+
+        launcher.check_run_worker_health(run)
+
+        assert mock_celery_app.control.inspect.call_count == 1
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_empty_ping_with_foreign_heartbeat_stays_unconfirmed(
+        self, _sleep, launcher, mock_celery_app
+    ):
+        run = self._started_run_with_empty_ping(mock_celery_app)
+        _install_heartbeat_events(
+            mock_celery_app,
+            [{"hostname": "celery@some-other-worker", "type": "worker-heartbeat"}],
+        )
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in (health.msg or "").lower()
+        assert launcher._worker_health_strikes == {"test-run-id": 1}  # noqa: SLF001
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_empty_ping_with_no_events_stays_unconfirmed(self, _sleep, launcher, mock_celery_app):
+        run = self._started_run_with_empty_ping(mock_celery_app)
+        _install_heartbeat_events(mock_celery_app, [])
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in (health.msg or "").lower()
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_heartbeat_listener_error_falls_back_to_unconfirmed(
+        self, _sleep, launcher, mock_celery_app
+    ):
+        run = self._started_run_with_empty_ping(mock_celery_app)
+
+        def _raise(connection, handlers):
+            raise OSError("broker connection refused")
+
+        mock_celery_app.events.Receiver = _raise
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in (health.msg or "").lower()
+
+
+class TestPingTimeout:
+    def test_ping_uses_configured_timeout(self, launcher, mock_celery_app):
+        launcher.ping_timeout = 7.5
+        mock_celery_app.control.inspect.return_value.ping.return_value = {
+            "celery@worker-pod-1": {"ok": "pong"}
+        }
+
+        result = launcher._ping_hostname("celery@worker-pod-1")  # noqa: SLF001
+
+        assert result.status == WorkerStatus.RUNNING
+        mock_celery_app.control.inspect.assert_called_once_with(
+            destination=["celery@worker-pod-1"], timeout=7.5
+        )
+
+    def test_ping_timeout_config_field_default(self):
+        field = CeleryRunLauncher.config_type()["ping_timeout"]
+        assert field.default_value == 10.0
+        assert not field.is_required
+
+
+class TestFreshControlApp:
+    def test_ping_goes_through_control_app_not_cached_app(self, launcher, mock_celery_app):
+        """Pings must use the short-lived control app, never the long-lived cached
+        app: the cached app's mailbox reply routing can rot (alupar incident),
+        while a fresh app per check matches the always-healthy CLI behavior.
+        """
+        sentinel_app = MagicMock()
+        sentinel_app.control.inspect.return_value.ping.return_value = {
+            "celery@worker-pod-1": {"ok": "pong"}
+        }
+        launcher._control_app = lambda: nullcontext(sentinel_app)  # noqa: SLF001
+
+        result = launcher._ping_hostname("celery@worker-pod-1")  # noqa: SLF001
+
+        assert result.status == WorkerStatus.RUNNING
+        sentinel_app.control.inspect.assert_called_once()
+        mock_celery_app.control.inspect.assert_not_called()
+
+    def test_default_control_app_builds_and_closes_fresh_app(self):
+        with patch.object(CeleryRunLauncher, "__init__", lambda self: None):
+            obj = CeleryRunLauncher.__new__(CeleryRunLauncher)
+        obj.broker = "redis://localhost:6379/0"
+        obj.backend = "redis://localhost:6379/0"
+        obj.include = []
+        obj.config_source = {}
+        obj.default_queue = "dagster"
+
+        with patch("dagster_celery.launcher.make_app") as mock_make_app:
+            fresh = MagicMock()
+            mock_make_app.return_value = fresh
+            with obj._control_app() as app:  # noqa: SLF001
+                assert app is fresh
+                fresh.close.assert_not_called()
+            mock_make_app.assert_called_once_with(app_args=obj.app_args())
+            fresh.close.assert_called_once()
+
+    def test_recover_task_id_goes_through_control_app(self, launcher, mock_celery_app):
+        sentinel_app = MagicMock()
+        sentinel_app.control.inspect.return_value.active.return_value = {}
+        sentinel_app.control.inspect.return_value.reserved.return_value = {}
+        launcher._control_app = lambda: nullcontext(sentinel_app)  # noqa: SLF001
+        run = _make_run(task_id=None)
+        run.tags = {}
+
+        launcher._recover_task_id(run)  # noqa: SLF001
+
+        sentinel_app.control.inspect.assert_called_once()
+        mock_celery_app.control.inspect.assert_not_called()

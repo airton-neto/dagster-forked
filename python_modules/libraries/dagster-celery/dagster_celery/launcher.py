@@ -1,6 +1,7 @@
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,15 @@ DEFAULT_WORKER_HEALTH_CONFIRMATION_CYCLES = 5
 # clears them).
 _MAX_TRACKED_HEALTH_STRIKES = 1000
 
+# Reply wait for control-plane pings. Kept generous: an in-pod probe at 10s
+# stayed healthy throughout an incident where a 2s wait failed every attempt.
+DEFAULT_PING_TIMEOUT_SECONDS = 10.0
+
+# How long to listen on the events channel for corroborating worker heartbeats
+# after an empty ping reply. Workers heartbeat every ~2s (celery default), so
+# this window spans several intervals.
+HEARTBEAT_LISTEN_TIMEOUT_SECONDS = 6.0
+
 from dagster_celery.config import DEFAULT_CONFIG, TASK_EXECUTE_JOB_NAME, TASK_RESUME_JOB_NAME
 from dagster_celery.defaults import task_default_queue
 from dagster_celery.make_app import make_app
@@ -90,6 +100,7 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         config_source: dict | None = None,
         inst_data: ConfigurableClassData | None = None,
         worker_health_confirmation_cycles: int | None = None,
+        ping_timeout: float | None = None,
     ) -> None:
         self._inst_data = check.opt_inst_param(inst_data, "inst_data", ConfigurableClassData)
 
@@ -104,6 +115,9 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             worker_health_confirmation_cycles,
             "worker_health_confirmation_cycles",
             default=DEFAULT_WORKER_HEALTH_CONFIRMATION_CYCLES,
+        )
+        self.ping_timeout = check.opt_float_param(
+            ping_timeout, "ping_timeout", default=DEFAULT_PING_TIMEOUT_SECONDS
         )
         # Consecutive soft-failure strikes per run_id, held in the (long-lived)
         # monitoring daemon process.
@@ -131,6 +145,26 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             "config_source": self.config_source,
             "task_default_queue": self.default_queue,
         }
+
+    @contextmanager
+    def _control_app(self) -> Iterator[Celery]:
+        """Short-lived Celery app for control-plane calls (pings, inventory, events).
+
+        The long-lived app's control mailbox reply routing can silently rot in the
+        daemon process (observed as deterministic empty ping replies from a live
+        worker for days, while a fresh CLI client pinging the same worker over the
+        same broker never failed). A fresh app per call carries none of that state.
+        """
+        app = make_app(app_args=self.app_args())
+        try:
+            yield app
+        finally:
+            try:
+                app.close()
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Failed to close short-lived celery control app", exc_info=True
+                )
 
     def launch_run(self, context: LaunchRunContext) -> None:
         run = context.dagster_run
@@ -397,8 +431,9 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         """
         logger = logging.getLogger(__name__)
         try:
-            inspector = self.celery.control.inspect(timeout=2.0)
-            inventories = (inspector.active() or {}, inspector.reserved() or {})
+            with self._control_app() as app:
+                inspector = app.control.inspect(timeout=self.ping_timeout)
+                inventories = (inspector.active() or {}, inspector.reserved() or {})
         except Exception as e:
             logger.warning(
                 "Failed to inspect the worker task inventory while recovering the"
@@ -493,11 +528,12 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
     def _ping_hostname(self, worker_hostname: str) -> CheckRunHealthResult:
         logger = logging.getLogger(__name__)
         try:
-            inspector = self.celery.control.inspect(
-                destination=[worker_hostname],
-                timeout=2.0,
-            )
-            ping_response = inspector.ping()
+            with self._control_app() as app:
+                inspector = app.control.inspect(
+                    destination=[worker_hostname],
+                    timeout=self.ping_timeout,
+                )
+                ping_response = inspector.ping()
         except Exception as e:
             logger.warning(
                 "Failed to ping Celery worker %s: %s. Reporting worker status as UNKNOWN.",
@@ -511,16 +547,67 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         if ping_response and isinstance(ping_response, dict) and worker_hostname in ping_response:
             return CheckRunHealthResult(WorkerStatus.RUNNING)
 
-        # An empty reply is indistinguishable from a broker/network brownout: the
-        # broadcast reply simply may not have arrived within the timeout while the
-        # worker is alive and mid-run. Report UNKNOWN so the monitoring daemon's
-        # consecutive-UNKNOWN threshold decides, instead of failing the run on a
-        # single lost ping (which strands a zombie worker that later overwrites the
-        # FAILURE status with SUCCESS).
+        # An empty reply is NOT proof of death: the request-reply chain has more
+        # failure modes on the requester side than on the worker (broker brownout,
+        # rotten reply routing). Workers publish heartbeat/task events every few
+        # seconds on an independent one-way channel — a fresh event from this
+        # hostname is positive evidence of life and overrides the lost ping.
+        if self._worker_heartbeat_seen(worker_hostname):
+            logger.warning(
+                "Celery worker %s did not reply to ping but published a heartbeat"
+                " event — treating as alive. The control reply path may be degraded.",
+                worker_hostname,
+            )
+            return CheckRunHealthResult(
+                WorkerStatus.RUNNING,
+                f"Celery worker {worker_hostname} did not reply to ping but published"
+                " a heartbeat event — treating as alive.",
+            )
+
+        # No reply and no heartbeat: report UNKNOWN so the strike counter decides,
+        # instead of failing the run on a single lost ping (which strands a zombie
+        # worker that later overwrites the FAILURE status with SUCCESS).
         return CheckRunHealthResult(
             WorkerStatus.UNKNOWN,
-            f"Celery worker {worker_hostname} did not reply to ping within the timeout.",
+            f"Celery worker {worker_hostname} did not reply to ping within the timeout"
+            " and no heartbeat event was observed.",
         )
+
+    def _worker_heartbeat_seen(
+        self,
+        worker_hostname: str,
+        listen_timeout: float = HEARTBEAT_LISTEN_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Listen briefly on the celery events channel for any event from the worker.
+
+        Workers send heartbeats every ~2s (plus task events) when started with
+        ``--events``; observing one is positive evidence of life that does not
+        depend on the pidbox request-reply plumbing. Returns False on any error or
+        when events are disabled — degrading to the strike path, never blocking.
+        """
+        seen = False
+        try:
+            with self._control_app() as app, app.connection_for_read() as connection:
+
+                def on_event(event: dict) -> None:
+                    nonlocal seen
+                    if event.get("hostname") == worker_hostname:
+                        seen = True
+                        receiver.should_stop = True
+
+                receiver = app.events.Receiver(connection, handlers={"*": on_event})
+                try:
+                    receiver.capture(limit=None, timeout=listen_timeout, wakeup=False)
+                except TimeoutError:
+                    pass
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Failed to listen for heartbeat events from Celery worker %s: %s",
+                worker_hostname,
+                e,
+            )
+            return False
+        return seen
 
     @staticmethod
     def _get_worker_hostname(result: "AsyncResult") -> "str | None":
@@ -617,6 +704,16 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                     " ping reply, PENDING task state, broker errors) must persist before"
                     " the run worker is reported FAILED. Unconfirmed cycles report the"
                     " worker as alive, absorbing transient broker/network disruptions."
+                ),
+            ),
+            "ping_timeout": Field(
+                float,
+                is_required=False,
+                default_value=DEFAULT_PING_TIMEOUT_SECONDS,
+                description=(
+                    "Seconds to wait for a worker's reply to the health-check ping."
+                    " An empty reply is further corroborated against worker heartbeat"
+                    " events before counting toward the failure strike threshold."
                 ),
             ),
         }
