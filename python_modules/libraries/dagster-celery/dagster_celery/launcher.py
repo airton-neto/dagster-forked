@@ -309,26 +309,108 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         ``_ping_hostname``; only uncorroborated soft failures accumulate strikes.
         """
         raw = self._check_run_worker_health_raw(run)
-        return self._confirm_worker_health(run.run_id, raw)
+        return self._confirm_worker_health(
+            run.run_id, raw, task_id=run.tags.get(DAGSTER_CELERY_TASK_ID_TAG)
+        )
+
+    def _veto_failure_if_task_alive(
+        self, failure: CheckRunHealthResult, task_id: str | None
+    ) -> CheckRunHealthResult:
+        """Last gate before a run worker is declared dead.
+
+        Death is only reported when a positive check corroborates it. If the fleet
+        says the task is still executing, the FAILED verdict is vetoed; if the
+        fleet cannot be reached at all, that silence is recorded in the message
+        but does not by itself keep the verdict from standing (the caller has
+        already exhausted pings, heartbeats and the confirmation cycles).
+        """
+        if not task_id:
+            return failure
+
+        found = self._task_found_in_fleet(task_id)
+        if found is True:
+            logging.getLogger(__name__).warning(
+                "Vetoing FAILED verdict for task %s: it is still in a worker's"
+                " inventory fleet-wide. Original verdict: %s",
+                task_id,
+                failure.msg,
+            )
+            return CheckRunHealthResult(
+                WorkerStatus.RUNNING,
+                f"Worker health check reported failure ({failure.msg}) but task {task_id} is"
+                " still present in a worker's inventory fleet-wide — treating as alive.",
+            )
+
+        corroboration = (
+            "no worker in the fleet holds this task"
+            if found is False
+            else "fleet-wide inventory was inconclusive (no worker replied)"
+        )
+        return CheckRunHealthResult(
+            WorkerStatus.FAILED,
+            f"{failure.msg} Corroboration: {corroboration}.",
+        )
+
+    def _task_found_in_fleet(self, task_id: str) -> bool | None:
+        """Is this task in ANY worker's active/reserved inventory, fleet-wide?
+
+        Silence from one hostname is not death. Before a run worker is declared
+        dead we ask every worker whether it is running this task: a pod may have
+        been rescheduled under a different hostname, or the tagged hostname's
+        reply path may be degraded while the task runs on happily elsewhere.
+
+        Returns True (found — demonstrably alive), False (fleet answered and
+        nobody holds it — corroborates death), or None (nobody answered at all,
+        so this signal is unusable and must not be read as death).
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            with self._control_app() as app:
+                inspector = app.control.inspect(timeout=self.ping_timeout)
+                active = inspector.active()
+                reserved = inspector.reserved()
+        except Exception as e:
+            logger.warning("Fleet-wide task inventory failed for task %s: %s", task_id, e)
+            return None
+
+        if not active and not reserved:
+            # No worker replied — cannot distinguish "nobody has it" from "nobody
+            # is listening". Inconclusive, never evidence of death.
+            return None
+
+        for inventory in (active or {}, reserved or {}):
+            for tasks in inventory.values():
+                for task in tasks or ():
+                    if task.get("id") == task_id:
+                        return True
+        return False
 
     def _confirm_worker_health(
-        self, run_id: str, raw: CheckRunHealthResult
+        self, run_id: str, raw: CheckRunHealthResult, task_id: str | None = None
     ) -> CheckRunHealthResult:
         if len(self._worker_health_strikes) > _MAX_TRACKED_HEALTH_STRIKES:
             self._worker_health_strikes.clear()
 
-        if raw.status in (WorkerStatus.RUNNING, WorkerStatus.SUCCESS, WorkerStatus.FAILED):
-            # RUNNING/SUCCESS: healthy — reset the streak. FAILED: hard evidence
-            # from the result backend — no confirmation needed.
+        if raw.status in (WorkerStatus.RUNNING, WorkerStatus.SUCCESS):
             self._worker_health_strikes.pop(run_id, None)
             return raw
+
+        if raw.status == WorkerStatus.FAILED:
+            # Hard evidence — but a FAILED verdict kills and relaunches a run, so
+            # give the fleet one last chance to prove the task is still executing
+            # somewhere before we act on it.
+            self._worker_health_strikes.pop(run_id, None)
+            return self._veto_failure_if_task_alive(raw, task_id)
 
         strikes = self._worker_health_strikes.get(run_id, 0) + 1
         if strikes >= self.worker_health_confirmation_cycles:
             self._worker_health_strikes.pop(run_id, None)
-            return CheckRunHealthResult(
-                WorkerStatus.FAILED,
-                f"Worker health unconfirmed for {strikes} consecutive checks: {raw.msg}",
+            return self._veto_failure_if_task_alive(
+                CheckRunHealthResult(
+                    WorkerStatus.FAILED,
+                    f"Worker health unconfirmed for {strikes} consecutive checks: {raw.msg}",
+                ),
+                task_id,
             )
 
         self._worker_health_strikes[run_id] = strikes
@@ -380,7 +462,7 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             if task_status == "FAILURE":
                 return CheckRunHealthResult(WorkerStatus.FAILED, "Celery task failed.")
             if task_status == "STARTED":
-                ping_result = self._ping_worker(run, result)
+                ping_result = self._ping_worker(run, result, task_id)
                 if ping_result.status == WorkerStatus.RUNNING:
                     return ping_result
                 # Ping failed — might be transient, retry
@@ -391,7 +473,7 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                 # run with its hostname, ping it directly instead of giving up.
                 tagged_hostname = run.tags.get(DAGSTER_CELERY_WORKER_HOSTNAME_TAG)
                 if tagged_hostname:
-                    ping_result = self._ping_hostname(tagged_hostname)
+                    ping_result = self._ping_hostname(tagged_hostname, task_id=task_id)
                     if ping_result.status == WorkerStatus.RUNNING:
                         return ping_result
                     last_result = CheckRunHealthResult(
@@ -507,11 +589,15 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             " the run.",
         )
 
-    def _ping_worker(self, run: DagsterRun, result: "AsyncResult") -> CheckRunHealthResult:
+    def _ping_worker(
+        self, run: DagsterRun, result: "AsyncResult", task_id: str | None = None
+    ) -> CheckRunHealthResult:
         """Ping the Celery worker for a STARTED task. Single attempt, no retries.
 
         Prefers the hostname tagged on the run by the executing worker over the
-        result-backend meta, which a duplicate delivery may have overwritten.
+        result-backend meta, which a duplicate delivery may have overwritten. The
+        task id is threaded through so a reply can be identity-checked against the
+        worker's own request table — see ``_confirm_task_on_worker``.
         """
         logger = logging.getLogger(__name__)
         worker_hostname = run.tags.get(
@@ -527,9 +613,60 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                 "Cannot determine Celery worker hostname from task result.",
             )
 
-        return self._ping_hostname(worker_hostname)
+        return self._ping_hostname(worker_hostname, task_id=task_id)
 
-    def _ping_hostname(self, worker_hostname: str) -> CheckRunHealthResult:
+    def _confirm_task_on_worker(
+        self, inspector: Any, worker_hostname: str, task_id: str
+    ) -> CheckRunHealthResult:
+        """Confirm the worker that answered the ping still holds this task.
+
+        A ping reply proves the *hostname* is alive, not that it is still running
+        our task. Celery workers run as StatefulSets with stable ordinal hostnames,
+        so when the pod owning a hostname dies mid-task and Kubernetes brings up a
+        replacement — rolling deploy, node eviction, KEDA scale-down-then-up — the
+        new pod answers to the same hostname. Trusting the ping alone reports a
+        crashed run as RUNNING until ``max_runtime``.
+
+        ``query_task`` asks the worker whether that id is in its own request table.
+        A definitive "no" is decisive (retrying cannot make the id appear there);
+        anything ambiguous degrades to UNKNOWN so the strike counter decides.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            task_query_response = inspector.query_task(task_id)
+        except Exception as e:
+            logger.warning(
+                "Failed to query task %s on Celery worker %s: %s. Reporting UNKNOWN.",
+                task_id,
+                worker_hostname,
+                e,
+            )
+            return CheckRunHealthResult(
+                WorkerStatus.UNKNOWN,
+                f"Failed to query task {task_id} on Celery worker {worker_hostname}: {e}",
+            )
+
+        if worker_hostname not in (task_query_response or {}):
+            # It answered the ping moments ago but not this query — it may have gone
+            # away between the two round trips. Ambiguous, not a confirmed mismatch.
+            return CheckRunHealthResult(
+                WorkerStatus.UNKNOWN,
+                f"No query_task reply from Celery worker {worker_hostname} for task {task_id}.",
+            )
+
+        if task_id in (task_query_response[worker_hostname] or {}):
+            return CheckRunHealthResult(WorkerStatus.RUNNING)
+
+        return CheckRunHealthResult(
+            WorkerStatus.FAILED,
+            f"Celery worker {worker_hostname} responded to ping but has no record of task"
+            f" {task_id}. The worker hostname was likely reused by an unrelated task after a"
+            " pod restart / KEDA scale-down-then-up cycle.",
+        )
+
+    def _ping_hostname(
+        self, worker_hostname: str, task_id: str | None = None
+    ) -> CheckRunHealthResult:
         logger = logging.getLogger(__name__)
         try:
             with self._control_app() as app:
@@ -538,6 +675,14 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                     timeout=self.ping_timeout,
                 )
                 ping_response = inspector.ping()
+                if (
+                    ping_response
+                    and isinstance(ping_response, dict)
+                    and worker_hostname in ping_response
+                ):
+                    if not task_id:
+                        return CheckRunHealthResult(WorkerStatus.RUNNING)
+                    return self._confirm_task_on_worker(inspector, worker_hostname, task_id)
         except Exception as e:
             logger.warning(
                 "Failed to ping Celery worker %s: %s. Reporting worker status as UNKNOWN.",
@@ -548,9 +693,9 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                 WorkerStatus.UNKNOWN,
                 f"Failed to ping Celery worker {worker_hostname}: {e}",
             )
-        if ping_response and isinstance(ping_response, dict) and worker_hostname in ping_response:
-            return CheckRunHealthResult(WorkerStatus.RUNNING)
-
+        # Reaching here means the ping produced no reply from this hostname — a
+        # successful reply is resolved (and identity-checked) inside the block above.
+        #
         # An empty reply is NOT proof of death: the request-reply chain has more
         # failure modes on the requester side than on the worker (broker brownout,
         # rotten reply routing). Workers publish heartbeat/task events every few

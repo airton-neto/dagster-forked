@@ -59,6 +59,38 @@ def _make_run(status=DagsterRunStatus.STARTED, task_id="test-task-123"):
     return run
 
 
+def _worker_holds_task(inspect_mock, hostname="celery@worker-pod-1", task_id="test-task-123"):
+    """Make a mocked inspector report that `hostname` still holds `task_id`.
+
+    A live worker must satisfy the ping AND the query_task identity check, so a
+    ping-only stub no longer represents one — see
+    ``CeleryRunLauncher._confirm_task_on_worker``.
+    """
+    inspect_mock.query_task.return_value = {hostname: {task_id: ["active", {}]}}
+    return inspect_mock
+
+
+def _fleet_holds_task(mock_celery_app, task_id="test-task-123"):
+    """Make the fleet-wide inventory report that some worker is running `task_id`."""
+    inspector = mock_celery_app.control.inspect.return_value
+    inspector.active.return_value = {
+        "celery@some-worker": [{"id": task_id, "args": "[]", "kwargs": "{}"}]
+    }
+    inspector.reserved.return_value = {}
+
+
+def _fleet_empty(mock_celery_app):
+    """Workers DO reply, and none of them holds any task.
+
+    Distinct from nobody replying at all: celery returns ``{hostname: []}`` for a
+    worker that answered with an empty request table, versus ``None``/``{}`` when
+    no worker answered. Only the former is evidence about the task.
+    """
+    inspector = mock_celery_app.control.inspect.return_value
+    inspector.active.return_value = {"celery@worker-pod-1": [], "celery@worker-pod-2": []}
+    inspector.reserved.return_value = {"celery@worker-pod-1": [], "celery@worker-pod-2": []}
+
+
 class TestResumeRun:
     def test_resume_run_calls_create_resume_job_task_with_celery_app(self, launcher):
         """resume_run must pass self.celery (the Celery app), not args, to create_resume_job_task."""
@@ -407,7 +439,7 @@ class TestCheckRunWorkerHealth:
         # First call: no response. Second call: success.
         inspect_fail = MagicMock()
         inspect_fail.ping.return_value = None
-        inspect_ok = MagicMock()
+        inspect_ok = _worker_holds_task(MagicMock())
         inspect_ok.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
         mock_celery_app.control.inspect.side_effect = [inspect_fail, inspect_ok]
 
@@ -428,7 +460,7 @@ class TestCheckRunWorkerHealth:
         type(result).state = property(lambda self, _iter=result_states: next(_iter))
         result.info = {"hostname": "celery@worker-pod-1"}
 
-        inspect_ok = MagicMock()
+        inspect_ok = _worker_holds_task(MagicMock())
         inspect_ok.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
         mock_celery_app.control.inspect.return_value = inspect_ok
 
@@ -455,7 +487,7 @@ class TestWorkerHealthConfirmation:
         mock_celery_app.control.inspect.return_value = inspect_mock
 
     def _healthy_ping(self, mock_celery_app):
-        inspect_mock = MagicMock()
+        inspect_mock = _worker_holds_task(MagicMock())
         inspect_mock.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
         mock_celery_app.control.inspect.return_value = inspect_mock
 
@@ -917,6 +949,176 @@ class TestTerminate:
 
         assert launcher.terminate("test-run-id") is False
         mock_celery_app.AsyncResult.return_value.revoke.assert_not_called()
+
+
+class TestWorkerIdentityOnHostnameReuse:
+    """A ping reply proves the HOSTNAME is alive, not that it still runs OUR task.
+
+    Celery workers run as StatefulSets with stable ordinal hostnames
+    (celery@worker-intraday-0). When the pod owning a hostname dies mid-task and
+    Kubernetes brings up a replacement — a rolling deploy, a node eviction, or a
+    KEDA scale-down-then-up — the new pod answers to the SAME hostname. Trusting
+    the ping alone reports a crashed run as RUNNING until max_runtime.
+
+    Migration 0009 fixed this in wheel 0.29.11 with an inspect().query_task()
+    identity check; the check was lost in the rebase that produced 0.29.16 and
+    stayed missing through .post1/.post2. Observed in production on auren
+    2026-08-07: run 1d00a3cf lost its worker at 14:52:16 to a rolling deploy and
+    was still reported RUNNING 40+ minutes later, while a sibling run whose
+    hostname was genuinely absent was correctly detected and resumed.
+    """
+
+    def _started_run_on(self, mock_celery_app, hostname="celery@worker-intraday-0"):
+        mock_celery_app.AsyncResult.return_value.state = "STARTED"
+        mock_celery_app.control.inspect.return_value.ping.return_value = {hostname: {"ok": "pong"}}
+        run = _make_run()
+        run.tags = {
+            DAGSTER_CELERY_TASK_ID_TAG: "test-task-123",
+            DAGSTER_CELERY_WORKER_HOSTNAME_TAG: hostname,
+        }
+        return run
+
+    def test_impostor_worker_answering_ping_is_not_reported_running(
+        self, launcher, mock_celery_app
+    ):
+        """The replacement pod answers the ping but holds a different task."""
+        run = self._started_run_on(mock_celery_app)
+        # Hostname is alive, but its request table holds an unrelated task.
+        mock_celery_app.control.inspect.return_value.query_task.return_value = {
+            "celery@worker-intraday-0": {"some-other-task": ["reserved", {}]}
+        }
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.FAILED
+        assert "no record of" in (health.msg or "")
+
+    def test_worker_still_holding_the_task_is_running(self, launcher, mock_celery_app):
+        """The genuine worker lists our task id — healthy, no strike."""
+        run = self._started_run_on(mock_celery_app)
+        mock_celery_app.control.inspect.return_value.query_task.return_value = {
+            "celery@worker-intraday-0": {"test-task-123": ["active", {}]}
+        }
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert launcher._worker_health_strikes == {}  # noqa: SLF001
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_query_task_no_reply_is_unconfirmed_not_failed(self, _sleep, launcher, mock_celery_app):
+        """Worker answered the ping then went quiet — ambiguous, use the strike path."""
+        run = self._started_run_on(mock_celery_app)
+        mock_celery_app.control.inspect.return_value.query_task.return_value = {}
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in (health.msg or "").lower()
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_query_task_error_is_unconfirmed_not_failed(self, _sleep, launcher, mock_celery_app):
+        """A broker error during the identity check must not fail the run outright."""
+        run = self._started_run_on(mock_celery_app)
+        mock_celery_app.control.inspect.return_value.query_task.side_effect = OSError(
+            "broker connection reset"
+        )
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in (health.msg or "").lower()
+
+
+class TestDeathRequiresCorroboration:
+    """Silence is not death. Before a run worker is declared dead, a positive
+    check must corroborate it — a worker that stops replying to pings, or stops
+    logging, may still be executing the task perfectly well (the alupar
+    2026-08-04 incident: pings failed 15/15 for days against a live, working
+    worker). Every FAILED verdict is therefore gated on a fleet-wide inventory
+    that asks all workers whether they still hold the task.
+    """
+
+    def _unreachable_tagged_worker(self, mock_celery_app):
+        mock_celery_app.AsyncResult.return_value.state = "STARTED"
+        inspector = mock_celery_app.control.inspect.return_value
+        inspector.ping.return_value = {}
+        run = _make_run()
+        run.tags = {
+            DAGSTER_CELERY_TASK_ID_TAG: "test-task-123",
+            DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@worker-pod-1",
+        }
+        return run
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_strike_threshold_does_not_fail_a_task_still_running_in_the_fleet(
+        self, _sleep, launcher, mock_celery_app
+    ):
+        """The alupar case: pings lost, but the task is demonstrably still executing."""
+        run = self._unreachable_tagged_worker(mock_celery_app)
+        _install_heartbeat_events(mock_celery_app, [])
+        _fleet_holds_task(mock_celery_app)
+
+        health = None
+        for _ in range(launcher.worker_health_confirmation_cycles):
+            health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "still present in a worker's inventory" in (health.msg or "")
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_strike_threshold_fails_when_fleet_confirms_task_is_gone(
+        self, _sleep, launcher, mock_celery_app
+    ):
+        """Pings lost AND no worker anywhere holds the task — corroborated death."""
+        run = self._unreachable_tagged_worker(mock_celery_app)
+        _install_heartbeat_events(mock_celery_app, [])
+        _fleet_empty(mock_celery_app)
+
+        health = None
+        for _ in range(launcher.worker_health_confirmation_cycles):
+            health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.FAILED
+        assert "no worker in the fleet holds this task" in (health.msg or "")
+
+    def test_hostname_reuse_failure_is_vetoed_when_task_runs_elsewhere(
+        self, launcher, mock_celery_app
+    ):
+        """Task moved to another hostname — the identity mismatch must not kill it."""
+        mock_celery_app.AsyncResult.return_value.state = "STARTED"
+        inspector = mock_celery_app.control.inspect.return_value
+        inspector.ping.return_value = {"celery@worker-pod-1": {"ok": "pong"}}
+        inspector.query_task.return_value = {
+            "celery@worker-pod-1": {"unrelated-task": ["active", {}]}
+        }
+        _fleet_holds_task(mock_celery_app)
+        run = _make_run()
+        run.tags = {
+            DAGSTER_CELERY_TASK_ID_TAG: "test-task-123",
+            DAGSTER_CELERY_WORKER_HOSTNAME_TAG: "celery@worker-pod-1",
+        }
+
+        health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_unreachable_fleet_is_recorded_as_inconclusive(self, _sleep, launcher, mock_celery_app):
+        """If nobody replies to the inventory, say so rather than implying proof."""
+        run = self._unreachable_tagged_worker(mock_celery_app)
+        _install_heartbeat_events(mock_celery_app, [])
+        inspector = mock_celery_app.control.inspect.return_value
+        inspector.active.return_value = {}
+        inspector.reserved.return_value = {}
+        inspector.active.side_effect = OSError("broker unreachable")
+
+        health = None
+        for _ in range(launcher.worker_health_confirmation_cycles):
+            health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.FAILED
+        assert "inconclusive" in (health.msg or "")
 
 
 class FakeHeartbeatReceiver:

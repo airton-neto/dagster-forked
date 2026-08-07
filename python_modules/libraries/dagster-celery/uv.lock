@@ -875,7 +875,7 @@ test = [
 
 [[package]]
 name = "dagster-celery"
-version = "0.29.16.post2"
+version = "0.29.16.post3"
 source = { editable = "." }
 dependencies = [
     { name = "celery" },
