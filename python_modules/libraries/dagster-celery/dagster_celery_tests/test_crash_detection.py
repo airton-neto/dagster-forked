@@ -920,27 +920,98 @@ class TestTerminate:
 
 
 class FakeHeartbeatReceiver:
-    """Stands in for celery.events.Receiver: replays canned events into the handler."""
+    """Stands in for celery.events.Receiver, with kombu's real loop semantics.
 
-    def __init__(self, handlers, events):
+    ``ConsumerMixin.consume`` — which ``EventReceiver.capture`` drives — treats its
+    ``timeout`` as an *idle* timeout, not a deadline::
+
+        try:
+            conn.drain_events(timeout=safety_interval)
+        except socket.timeout:
+            elapsed += safety_interval
+            if timeout and elapsed >= timeout:
+                raise
+        else:
+            yield
+            elapsed = 0          # <-- any event resets the budget
+
+    So the loop only ends on ``should_stop`` or on ``timeout`` seconds of *total*
+    silence across every worker on the channel. This fake reproduces that: the
+    canned events replay forever, and TimeoutError is raised only when there are
+    no events at all to deliver.
+    """
+
+    # kombu drains with safety_interval=1, so each loop pass costs up to a second.
+    SAFETY_INTERVAL = 1.0
+
+    def __init__(self, handlers, events, clock=None):
         self.handlers = handlers
         self.events = events
         self.should_stop = False
+        self.iterations = 0
+        self._clock = clock
+
+    def on_iteration(self):
+        """No-op hook, exactly as kombu defines it — callers may replace it."""
+
+    def _tick(self):
+        """One loop pass: time advances, then ConsumerMixin calls on_iteration()."""
+        self.iterations += 1
+        if self._clock is not None:
+            self._clock.advance(self.SAFETY_INTERVAL)
+        self.on_iteration()
+        if self.iterations > _RUNAWAY_ITERATION_GUARD:
+            raise AssertionError(
+                "capture() did not terminate: _worker_heartbeat_seen blocked the"
+                f" run-monitoring thread for {self.iterations} loop passes."
+            )
 
     def capture(self, limit=None, timeout=None, wakeup=True):
         handler = self.handlers["*"]
-        for event in self.events:
-            if self.should_stop:
-                return
-            handler(event)
-        if not self.should_stop:
-            raise TimeoutError()
+        if not self.events:
+            # A genuinely idle channel: the built-in idle timeout does fire.
+            self._tick()
+            if not self.should_stop:
+                raise TimeoutError()
+            return
+        # A busy channel never goes idle, so the loop runs until should_stop.
+        while True:
+            for event in self.events:
+                self._tick()
+                if self.should_stop:
+                    return
+                handler(event)
+                if self.should_stop:
+                    return
 
 
-def _install_heartbeat_events(mock_celery_app, events):
-    mock_celery_app.events.Receiver = lambda connection, handlers: FakeHeartbeatReceiver(
-        handlers, events
-    )
+# Bounds the "never terminates" failure mode so the suite fails fast instead of hanging.
+_RUNAWAY_ITERATION_GUARD = 5000
+
+
+class FakeClock:
+    """Monotonic clock the fake receiver advances as its loop spins."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def __call__(self):
+        return self.now
+
+
+def _install_heartbeat_events(mock_celery_app, events, clock=None):
+    receivers = []
+
+    def _factory(connection, handlers):
+        receiver = FakeHeartbeatReceiver(handlers, events, clock=clock)
+        receivers.append(receiver)
+        return receiver
+
+    mock_celery_app.events.Receiver = _factory
+    return receivers
 
 
 class TestHeartbeatCorroboration:
@@ -1011,6 +1082,51 @@ class TestHeartbeatCorroboration:
 
         assert health.status == WorkerStatus.RUNNING
         assert "unconfirmed" in (health.msg or "").lower()
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_busy_events_channel_does_not_block_the_monitoring_thread(
+        self, _sleep, launcher, mock_celery_app
+    ):
+        """The heartbeat listen must be bounded by wall clock, not by channel idleness.
+
+        Regression for the 0.29.16.post1 fleet incident: on a server with more than
+        one worker, other workers heartbeat every ~2s, so kombu's idle timeout never
+        fires. With a dead target worker the listen never returned and the whole
+        run-monitoring daemon thread stalled — no max_runtime enforcement, no crash
+        detection, no resume, for every run on the server.
+        """
+        run = self._started_run_with_empty_ping(mock_celery_app, hostname="celery@dead-worker")
+        # Foreign traffic only: the target worker is dead, its neighbours are not.
+        clock = FakeClock()
+        receivers = _install_heartbeat_events(
+            mock_celery_app,
+            [{"hostname": "celery@some-other-worker", "type": "worker-heartbeat"}],
+            clock=clock,
+        )
+
+        with patch("dagster_celery.launcher.time.monotonic", clock):
+            health = launcher.check_run_worker_health(run)
+
+        assert health.status == WorkerStatus.RUNNING
+        assert "unconfirmed" in (health.msg or "").lower()
+        assert receivers, "expected the launcher to open an events receiver"
+        for receiver in receivers:
+            assert receiver.should_stop, (
+                "listen must stop itself on a busy channel; leaving should_stop False"
+                " is what hung the daemon in production"
+            )
+
+    @patch("dagster_celery.launcher.time.sleep")
+    def test_heartbeat_listen_stops_at_the_deadline(self, _sleep, launcher, mock_celery_app):
+        """The deadline is enforced from the loop hook, so it fires even under traffic."""
+        events = [{"hostname": "celery@noisy-neighbour", "type": "worker-heartbeat"}]
+        receivers = _install_heartbeat_events(mock_celery_app, events)
+
+        with patch("dagster_celery.launcher.time.monotonic", side_effect=[100.0, 100.0, 999.0]):
+            seen = launcher._worker_heartbeat_seen("celery@dead-worker")  # noqa: SLF001
+
+        assert seen is False
+        assert receivers[0].should_stop is True
 
     @patch("dagster_celery.launcher.time.sleep")
     def test_heartbeat_listener_error_falls_back_to_unconfirmed(

@@ -588,6 +588,14 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         ``--events``; observing one is positive evidence of life that does not
         depend on the pidbox request-reply plumbing. Returns False on any error or
         when events are disabled — degrading to the strike path, never blocking.
+
+        The listen window is enforced as a wall-clock deadline from the consumer's
+        per-iteration hook. ``capture``'s own ``timeout`` cannot do this: kombu's
+        ``ConsumerMixin.consume`` resets its elapsed counter on every event it
+        drains, so that timeout only fires after ``listen_timeout`` seconds of
+        silence from *every* worker on the channel. On a server with more than one
+        worker the channel is never that quiet, and a dead target worker would
+        otherwise hold the run-monitoring thread forever.
         """
         seen = False
         try:
@@ -600,6 +608,16 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                         receiver.should_stop = True
 
                 receiver = app.events.Receiver(connection, handlers={"*": on_event})
+                deadline = time.monotonic() + listen_timeout
+
+                def stop_at_deadline() -> None:
+                    if time.monotonic() >= deadline:
+                        receiver.should_stop = True
+
+                # ConsumerMixin calls on_iteration() once per loop pass — including
+                # passes that drained an event — so the deadline is honoured whether
+                # the channel is idle or busy.
+                receiver.on_iteration = stop_at_deadline
                 try:
                     receiver.capture(limit=None, timeout=listen_timeout, wakeup=False)
                 except TimeoutError:
