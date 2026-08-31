@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dagster-celery"
-version = "0.29.16.post3"
+version = "0.29.16.post4"
 description = "Package for using Celery as Dagster's execution engine."
 authors = [{name = "Dagster Labs", email = "hello@dagsterlabs.com"}]
 license = "Apache-2.0"
