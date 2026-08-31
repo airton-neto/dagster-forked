@@ -58,13 +58,18 @@ DEFAULT_PING_TIMEOUT_SECONDS = 10.0
 HEARTBEAT_LISTEN_TIMEOUT_SECONDS = 6.0
 
 # After a SIGTERM revoke, how long the launcher waits for the task to actually
-# leave the fleet before it escalates the revoke to SIGKILL. 0 disables the
-# escalation. Dagster's op-concurrency-pool wait loop does not check the
-# captured interrupt, so a SIGTERM delivered while a step waits on a pool is
-# only acted on when the step finally starts — up to hours later (auren-aes
-# 2026-08-31: "succeeded in 50738s"). The zombie holds its Celery slot for the
-# whole time, and on concurrency=1 workers a handful of them wedge the fleet.
-DEFAULT_TERMINATE_GRACE_SECONDS = 20.0
+# leave the fleet before it escalates the revoke to SIGKILL. Dagster's
+# op-concurrency-pool wait loop does not check the captured interrupt, so a
+# SIGTERM delivered while a step waits on a pool is only acted on when the step
+# finally starts — up to hours later (auren-aes 2026-08-31: "succeeded in
+# 50738s"). The zombie holds its Celery slot for the whole time, and on
+# concurrency=1 workers a handful of them wedge the fleet.
+#
+# Deliberately NOT a config field: the escalation is a correctness guarantee of
+# `terminate`, not an operator choice. The value reaches the launcher through
+# the `terminate_grace_seconds` instance attribute, which tests override (0
+# disables the escalation).
+TERMINATE_GRACE_SECONDS = 20.0
 
 # Gap between two fleet-inventory polls inside the grace window. Also caps the
 # per-poll inspect timeout, so the whole escalation stays inside the window
@@ -109,12 +114,10 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
       alive, so a broker or network blip does not kill a healthy run.
     - ``ping_timeout`` (float, default 10.0): seconds to wait for a worker
       reply to a health-check ping.
-    - ``terminate_grace_seconds`` (float, default 20.0): seconds to wait for
-      a task to leave the worker fleet after SIGTERM. If the task is still
-      there at the deadline, ``terminate`` escalates to SIGKILL. Set the field
-      to 0 to send SIGTERM only. A step that waits on an op concurrency pool
-      does not act on SIGTERM, so without the escalation the task keeps its
-      Celery slot for hours.
+
+    ``terminate`` also escalates a SIGTERM that the task ignores to SIGKILL.
+    That behaviour is internal and has no config field — see
+    ``TERMINATE_GRACE_SECONDS``.
     """
 
     _instance: DagsterInstance  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -130,7 +133,6 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         inst_data: ConfigurableClassData | None = None,
         worker_health_confirmation_cycles: int | None = None,
         ping_timeout: float | None = None,
-        terminate_grace_seconds: float | None = None,
     ) -> None:
         self._inst_data = check.opt_inst_param(inst_data, "inst_data", ConfigurableClassData)
 
@@ -149,11 +151,8 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         self.ping_timeout = check.opt_float_param(
             ping_timeout, "ping_timeout", default=DEFAULT_PING_TIMEOUT_SECONDS
         )
-        self.terminate_grace_seconds = check.opt_float_param(
-            terminate_grace_seconds,
-            "terminate_grace_seconds",
-            default=DEFAULT_TERMINATE_GRACE_SECONDS,
-        )
+        # Internal, not configurable — see TERMINATE_GRACE_SECONDS.
+        self.terminate_grace_seconds = TERMINATE_GRACE_SECONDS
         # Consecutive soft-failure strikes per run_id, held in the (long-lived)
         # monitoring daemon process.
         self._worker_health_strikes: dict[str, int] = {}
@@ -231,8 +230,9 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         captured interrupt, so a step that is waiting on a pool absorbs the
         signal and keeps its Celery slot until it finally starts — 14 hours
         later in the auren-aes 2026-08-31 incident. This method therefore polls
-        the fleet inventory for ``terminate_grace_seconds`` and escalates to
+        the fleet inventory for ``TERMINATE_GRACE_SECONDS`` and escalates to
         ``revoke(terminate=True, signal="SIGKILL")`` if the task is still there.
+        The grace window is internal and carries no config field.
 
         The run status is deliberately left alone. ``check_run_timeout``
         (``dagster/_daemon/monitoring/run_monitoring.py``) reports CANCELING,
@@ -1015,18 +1015,6 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
                     "Seconds to wait for a worker's reply to the health-check ping."
                     " An empty reply is further corroborated against worker heartbeat"
                     " events before counting toward the failure strike threshold."
-                ),
-            ),
-            "terminate_grace_seconds": Field(
-                float,
-                is_required=False,
-                default_value=DEFAULT_TERMINATE_GRACE_SECONDS,
-                description=(
-                    "Seconds to wait for a revoked task to leave the worker fleet after"
-                    " SIGTERM, before the revoke is escalated to SIGKILL. Set to 0 to"
-                    " disable the escalation and send SIGTERM only. A step waiting on an"
-                    " op concurrency pool does not act on SIGTERM, so without the"
-                    " escalation the task keeps its Celery slot indefinitely."
                 ),
             ),
         }

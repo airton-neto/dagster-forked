@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from dagster import DagsterRunStatus
 from dagster_celery.launcher import (
-    DEFAULT_TERMINATE_GRACE_SECONDS,
+    TERMINATE_GRACE_SECONDS,
     TERMINATE_POLL_INTERVAL_SECONDS,
     CeleryRunLauncher,
 )
@@ -44,7 +44,7 @@ def launcher(mock_celery_app):
         obj.default_queue = "dagster"
         obj.worker_health_confirmation_cycles = 3
         obj.ping_timeout = 10.0
-        obj.terminate_grace_seconds = DEFAULT_TERMINATE_GRACE_SECONDS
+        obj.terminate_grace_seconds = TERMINATE_GRACE_SECONDS
         obj._worker_health_strikes = {}  # noqa: SLF001
         obj._control_app = lambda: nullcontext(mock_celery_app)  # noqa: SLF001
         return obj
@@ -293,22 +293,48 @@ class TestResumeRunStaysSigtermOnly:
         mock_celery_app.control.inspect.assert_not_called()
 
 
-class TestTerminateGraceConfig:
-    def test_config_field_default(self):
-        field = CeleryRunLauncher.config_type()["terminate_grace_seconds"]
-        assert field.default_value == 20.0
-        assert not field.is_required
+class TestTerminateGraceIsInternal:
+    """The grace window is a correctness guarantee of terminate(), not an
+    operator knob. It must stay off the config schema, and every launcher must
+    get it.
+    """
 
-    def test_from_config_value_wires_the_field(self):
-        launcher = CeleryRunLauncher.from_config_value(
-            None,  # pyright: ignore[reportArgumentType]
-            {"default_queue": "dagster", "terminate_grace_seconds": 45.0},
-        )
-        assert launcher.terminate_grace_seconds == 45.0
+    def test_grace_window_is_twenty_seconds(self):
+        assert TERMINATE_GRACE_SECONDS == 20.0
 
-    def test_default_when_not_configured(self):
+    def test_not_exposed_as_a_config_field(self):
+        assert "terminate_grace_seconds" not in CeleryRunLauncher.config_type()
+
+    def test_launcher_built_from_config_gets_the_constant(self):
         launcher = CeleryRunLauncher.from_config_value(
             None,  # pyright: ignore[reportArgumentType]
             {"default_queue": "dagster"},
         )
-        assert launcher.terminate_grace_seconds == DEFAULT_TERMINATE_GRACE_SECONDS
+        assert launcher.terminate_grace_seconds == TERMINATE_GRACE_SECONDS
+
+    def test_config_value_for_the_removed_field_is_rejected(self):
+        """A dagster.yaml carrying the old field must fail loudly, not silently."""
+        with pytest.raises(TypeError):
+            CeleryRunLauncher.from_config_value(
+                None,  # pyright: ignore[reportArgumentType]
+                {"default_queue": "dagster", "terminate_grace_seconds": 45.0},
+            )
+
+    def test_instance_attribute_override_drives_the_deadline(
+        self, launcher, mock_celery_app, clock
+    ):
+        """Tests lower the window; the loop must honour the instance attribute."""
+        run = _make_run()
+        launcher._instance.get_run_by_id.return_value = run  # noqa: SLF001
+        launcher.terminate_grace_seconds = 6.0
+        _inventory(mock_celery_app, [_holding() for _ in range(10)])
+
+        assert launcher.terminate("test-run-id") is True
+
+        # 6s window / 2s poll interval
+        assert clock.sleeps == [TERMINATE_POLL_INTERVAL_SECONDS] * 3
+        assert _revoke_calls(mock_celery_app) == [
+            ((), {"terminate": True}),
+            ((), {"terminate": True, "signal": "SIGKILL"}),
+        ]
+        assert _event_metadata(launcher)["Terminate Grace Seconds"] == 6.0
