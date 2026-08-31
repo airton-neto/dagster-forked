@@ -17,7 +17,6 @@ from dagster._daemon.monitoring.run_monitoring import count_resume_run_attempts,
 from dagster_celery.launcher import (
     HEALTH_CHECK_MAX_RETRIES,
     TASK_SUCCESS_TERMINAL_GRACE_SECONDS,
-    TERMINATE_GRACE_SECONDS,
     CeleryRunLauncher,
 )
 from dagster_celery.tags import DAGSTER_CELERY_TASK_ID_TAG, DAGSTER_CELERY_WORKER_HOSTNAME_TAG
@@ -44,7 +43,6 @@ def launcher(mock_celery_app):
         obj.default_queue = "dagster"
         obj.worker_health_confirmation_cycles = 3
         obj.ping_timeout = 2.0
-        obj.terminate_grace_seconds = TERMINATE_GRACE_SECONDS
         obj._worker_health_strikes = {}  # noqa: SLF001
         # Control-plane calls go through a short-lived app; unit tests route them
         # back to the shared mock app.
@@ -934,14 +932,13 @@ class TestGetRunWorkerDebugInfo:
 
 class TestTerminate:
     def test_terminate_revokes_task(self, launcher, mock_celery_app):
-        """A task that leaves the fleet on SIGTERM gets exactly one revoke.
+        """terminate() sends exactly one revoke, the SIGTERM.
 
-        The SIGKILL escalation for a task that survives SIGTERM lives in
-        ``dagster_celery_tests/test_terminate.py``.
+        Confirming that the child actually died is the worker's job — see
+        ``dagster_celery/control.py`` and ``test_control.py``.
         """
         run = _make_run(task_id="task-9")
         launcher._instance.get_run_by_id.return_value = run  # noqa: SLF001
-        _fleet_empty(mock_celery_app)
 
         assert launcher.terminate("test-run-id") is True
         mock_celery_app.AsyncResult.assert_called_once_with("task-9")

@@ -57,26 +57,8 @@ DEFAULT_PING_TIMEOUT_SECONDS = 10.0
 # this window spans several intervals.
 HEARTBEAT_LISTEN_TIMEOUT_SECONDS = 6.0
 
-# After a SIGTERM revoke, how long the launcher waits for the task to actually
-# leave the fleet before it escalates the revoke to SIGKILL. Dagster's
-# op-concurrency-pool wait loop does not check the captured interrupt, so a
-# SIGTERM delivered while a step waits on a pool is only acted on when the step
-# finally starts — up to hours later (auren-aes 2026-08-31: "succeeded in
-# 50738s"). The zombie holds its Celery slot for the whole time, and on
-# concurrency=1 workers a handful of them wedge the fleet.
-#
-# Deliberately NOT a config field: the escalation is a correctness guarantee of
-# `terminate`, not an operator choice. The value reaches the launcher through
-# the `terminate_grace_seconds` instance attribute, which tests override (0
-# disables the escalation).
-TERMINATE_GRACE_SECONDS = 20.0
-
-# Gap between two fleet-inventory polls inside the grace window. Also caps the
-# per-poll inspect timeout, so the whole escalation stays inside the window
-# (self.ping_timeout defaults to 10s and would blow a 20s budget in two polls).
-TERMINATE_POLL_INTERVAL_SECONDS = 2.0
-
 from dagster_celery.config import DEFAULT_CONFIG, TASK_EXECUTE_JOB_NAME, TASK_RESUME_JOB_NAME
+from dagster_celery.control import ENSURE_TASK_DEAD_COMMAND, TERMINATE_GRACE_SECONDS
 from dagster_celery.defaults import task_default_queue
 from dagster_celery.make_app import make_app
 from dagster_celery.tags import (
@@ -115,9 +97,10 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
     - ``ping_timeout`` (float, default 10.0): seconds to wait for a worker
       reply to a health-check ping.
 
-    ``terminate`` also escalates a SIGTERM that the task ignores to SIGKILL.
-    That behaviour is internal and has no config field — see
-    ``TERMINATE_GRACE_SECONDS``.
+    ``terminate`` also asks the worker fleet to confirm that a revoked task
+    actually died, through the ``ensure_task_dead`` control command. That
+    behaviour is internal and has no config field — see
+    ``dagster_celery.control``.
     """
 
     _instance: DagsterInstance  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -151,8 +134,6 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         self.ping_timeout = check.opt_float_param(
             ping_timeout, "ping_timeout", default=DEFAULT_PING_TIMEOUT_SECONDS
         )
-        # Internal, not configurable — see TERMINATE_GRACE_SECONDS.
-        self.terminate_grace_seconds = TERMINATE_GRACE_SECONDS
         # Consecutive soft-failure strikes per run_id, held in the (long-lived)
         # monitoring daemon process.
         self._worker_health_strikes: dict[str, int] = {}
@@ -223,16 +204,30 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         )
 
     def terminate(self, run_id: str) -> bool:
-        """Revoke the run's Celery task, and confirm that it actually died.
+        """Revoke the run's Celery task, and ask the fleet to confirm it died.
 
-        A plain ``revoke(terminate=True)`` only sends SIGTERM to the billiard
-        child. Dagster's op-concurrency-pool wait loop does not check the
-        captured interrupt, so a step that is waiting on a pool absorbs the
-        signal and keeps its Celery slot until it finally starts — 14 hours
-        later in the auren-aes 2026-08-31 incident. This method therefore polls
-        the fleet inventory for ``TERMINATE_GRACE_SECONDS`` and escalates to
-        ``revoke(terminate=True, signal="SIGKILL")`` if the task is still there.
-        The grace window is internal and carries no config field.
+        ``revoke(terminate=True)`` only sends SIGTERM to the billiard child.
+        Dagster's op-concurrency-pool wait loop does not check the captured
+        interrupt, so a step waiting on a pool absorbs the signal and keeps its
+        Celery slot until it finally starts — 14 hours later in the auren-aes
+        2026-08-31 incident. This method therefore also broadcasts the
+        ``ensure_task_dead`` control command, and the worker that owns the task
+        kills the child itself if it is still running after the grace period.
+
+        The confirmation cannot happen here. ``Request.terminate`` empties the
+        worker's request tables the moment SIGTERM is sent, so the fleet
+        inventory reports the task gone whether or not the child died, and a
+        second SIGKILL revoke resolves against nothing — see
+        ``dagster_celery.control`` for the traced call paths.
+
+        Both calls are publish-only: this method never waits for a worker to
+        reply, and never sleeps. (A publish can still stall on a broker
+        brownout, exactly as the revoke above it can.) That matters because it
+        runs on the webserver request thread
+        (``queued_run_coordinator.cancel_run``), in the backfill daemon's serial
+        loop over up to 500 runs (``dagster/_core/execution/backfill.py``), and
+        in run monitoring. The worker logs the kill; the launcher reports no
+        engine event for it.
 
         The run status is deliberately left alone. ``check_run_timeout``
         (``dagster/_daemon/monitoring/run_monitoring.py``) reports CANCELING,
@@ -257,79 +252,36 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         result: AsyncResult = self.celery.AsyncResult(task_id)
         result.revoke(terminate=True)
 
-        if self.terminate_grace_seconds > 0:
-            self._escalate_to_sigkill_if_still_alive(run, result, task_id)
+        self._broadcast_ensure_task_dead(task_id)
 
         return True
 
-    def _escalate_to_sigkill_if_still_alive(
-        self, run: DagsterRun, result: "AsyncResult", task_id: str
-    ) -> bool:
-        """Poll the fleet until the task is gone, or SIGKILL it at the deadline.
+    def _broadcast_ensure_task_dead(self, task_id: str) -> None:
+        """Ask every worker to SIGKILL `task_id` if it outlives the grace period.
 
-        Returns True when SIGKILL was sent, False when the task left the fleet
-        on its own.
-
-        An inventory that stays unavailable for the whole window (nobody replies,
-        or the broker call raises) escalates too: the run is already being
-        terminated, so a redundant SIGKILL against a task that has already
-        exited costs nothing, while a live zombie holding a ``concurrency=1``
-        slot wedges every later run on that worker.
+        Fire-and-forget: `reply=False`, no waiting. A worker running an older
+        build does not have the command and ignores the broadcast, so launcher
+        and workers can be rolled out independently — the silent no-op is by
+        design. A broadcast failure is logged and swallowed, because the SIGTERM
+        has already gone out and terminate() must still report success.
         """
-        deadline = time.monotonic() + self.terminate_grace_seconds
-        found: bool | None = None
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-
-            found = self._task_found_in_fleet(
+        try:
+            with self._control_app() as app:
+                app.control.broadcast(
+                    ENSURE_TASK_DEAD_COMMAND,
+                    arguments={
+                        "task_id": task_id,
+                        "grace_seconds": TERMINATE_GRACE_SECONDS,
+                    },
+                    reply=False,
+                )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Failed to broadcast %s for task %s; the task keeps only the SIGTERM.",
+                ENSURE_TASK_DEAD_COMMAND,
                 task_id,
-                timeout=max(
-                    0.5, min(TERMINATE_POLL_INTERVAL_SECONDS, self.ping_timeout, remaining)
-                ),
+                exc_info=True,
             )
-            if found is False:
-                return False
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(TERMINATE_POLL_INTERVAL_SECONDS, remaining))
-
-        result.revoke(terminate=True, signal="SIGKILL")
-
-        inventory = (
-            "task still held by a worker" if found is True else "inconclusive (no worker replied)"
-        )
-        state = (
-            "was still held by a worker"
-            if found is True
-            else "could not be confirmed dead (no worker replied)"
-        )
-        logging.getLogger(__name__).warning(
-            "Celery task %s survived SIGTERM for %ss (fleet inventory: %s) — sending SIGKILL.",
-            task_id,
-            self.terminate_grace_seconds,
-            inventory,
-        )
-        self._instance.report_engine_event(
-            f"Celery task {task_id} {state}"
-            f" {self.terminate_grace_seconds}s after SIGTERM;"
-            " escalating the revoke to SIGKILL.",
-            run,
-            EngineEventData(
-                {
-                    "Run ID": run.run_id,
-                    "Celery Task ID": task_id,
-                    "Terminate Grace Seconds": self.terminate_grace_seconds,
-                    "Fleet Inventory": inventory,
-                }
-            ),
-            cls=self.__class__,
-        )
-        return True
 
     @property
     def supports_resume_run(self) -> bool:
@@ -343,8 +295,8 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         # during a broker/network brownout — and two workers must not execute the
         # same run concurrently. Best-effort: the revoke broadcast may not reach a
         # worker that is currently partitioned from the broker.
-        # This revoke stays SIGTERM-only, with no SIGKILL escalation: unlike
-        # `terminate`, its target may be a healthy worker that is merely
+        # This revoke stays SIGTERM-only, with no `ensure_task_dead` broadcast:
+        # unlike `terminate`, its target may be a healthy worker that is merely
         # partitioned, and it must be given the chance to shut the run down
         # cleanly rather than be killed mid-write.
         prior_task_id = run.tags.get(DAGSTER_CELERY_TASK_ID_TAG)
@@ -480,7 +432,7 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
             f"{failure.msg} Corroboration: {corroboration}.",
         )
 
-    def _task_found_in_fleet(self, task_id: str, timeout: float | None = None) -> bool | None:
+    def _task_found_in_fleet(self, task_id: str) -> bool | None:
         """Is this task in ANY worker's active/reserved inventory, fleet-wide?
 
         Silence from one hostname is not death. Before a run worker is declared
@@ -491,16 +443,11 @@ class CeleryRunLauncher(RunLauncher, ConfigurableClass):
         Returns True (found — demonstrably alive), False (fleet answered and
         nobody holds it — corroborates death), or None (nobody answered at all,
         so this signal is unusable and must not be read as death).
-
-        `timeout` overrides `self.ping_timeout` for callers that poll this on a
-        budget (see `_escalate_to_sigkill_if_still_alive`).
         """
         logger = logging.getLogger(__name__)
         try:
             with self._control_app() as app:
-                inspector = app.control.inspect(
-                    timeout=self.ping_timeout if timeout is None else timeout
-                )
+                inspector = app.control.inspect(timeout=self.ping_timeout)
                 active = inspector.active()
                 reserved = inspector.reserved()
         except Exception as e:

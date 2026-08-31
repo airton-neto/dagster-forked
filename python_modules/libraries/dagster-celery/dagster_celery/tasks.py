@@ -21,9 +21,16 @@ from dagster_celery.config import (
     TASK_EXECUTE_PLAN_NAME,
     TASK_RESUME_JOB_NAME,
 )
+from dagster_celery.control import ensure_task_dead
 from dagster_celery.core_execution_loop import DELEGATE_MARKER
 from dagster_celery.executor import CeleryExecutor
 from dagster_celery.tags import DAGSTER_CELERY_WORKER_HOSTNAME_TAG
+
+# Importing the control command registers it on celery's control Panel. Worker
+# entry points import this module to build their tasks (the fleet's
+# `keda_celery_app.py` does), so every worker gains `ensure_task_dead` without
+# any change on their side. Re-exported so the import cannot be tidied away.
+__all__ = ["ensure_task_dead"]
 
 
 def _guard_duplicate_delivery_and_tag_worker(
